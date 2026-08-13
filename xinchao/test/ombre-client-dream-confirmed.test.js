@@ -30,7 +30,8 @@ test('explicitly confirmed dreams may write while automatic OB writes stay disab
 
   assert.equal(bucketId, 'abc123def456');
   assert.equal(calls[0].name, 'hold');
-  assert.match(calls[0].args.content, /不是现实事件/);
+  assert.match(calls[0].args.content, /^我梦见：/);
+  assert.match(calls[0].args.content, /我知道这是睡眠结算产生的梦境，不是现实事件/);
   assert.equal(calls[0].args.feel, true);
   assert.equal(calls[1].name, 'trace');
   assert.deepEqual(calls[1].args, { bucket_id: 'abc123def456', dont_surface: 1 });

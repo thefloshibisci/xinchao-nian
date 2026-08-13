@@ -207,10 +207,10 @@ export class OmbreClient {
   async storeDream(dream, { confirmed = false } = {}) {
     if (!confirmed && !this.config.writeEnabled) return null;
     const content = [
-      `梦境：${dream.dream}`,
-      `梦境余韵：${dream.residue}`,
-      `醒后意识：${dream.awareness}`,
-      '说明：这是睡眠结算产生的梦境，不是现实事件；调用外部记忆服务不等于醒来。'
+      `我梦见：${dream.dream}`,
+      `我醒来后仍有这样的余韵：${dream.residue}`,
+      `我醒后的意识是：${dream.awareness}`,
+      '我知道这是睡眠结算产生的梦境，不是现实事件；调用外部记忆服务也不等于我醒来。'
     ].join('\n');
     const holdTool = await this.toolInfo('hold');
     const supported = new Set(Object.keys(holdTool?.inputSchema?.properties ?? {}));
