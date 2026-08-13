@@ -34,15 +34,11 @@ export class ModelClient {
       ],
       temperature: 0.9,
       max_tokens: this.config.maxOutputTokens,
-      thinking: { type: 'disabled' },
+      enable_thinking: false,
       response_format: { type: 'json_object' }
     };
 
-    let response = await this.request(body);
-    if (!response.ok && [400, 422].includes(response.status)) {
-      delete body.response_format;
-      response = await this.request(body);
-    }
+    const response = await this.requestCompatible(body);
     if (!response.ok) throw new Error(`model request failed: HTTP ${response.status}`);
     const payload = await response.json();
     const text = payload.choices?.[0]?.message?.content ?? '';
@@ -64,7 +60,7 @@ export class ModelClient {
       `最近已发送的跨类型 Bark：${formatRecentMessages(recentMessages)}`,
       rejectedMessage ? `刚被去重器拒绝的候选：${rejectedMessage}。主题和情绪可以不变，但要换成真正不同的措辞、角度和句式。` : ''
     ].join('\n');
-    const response = await this.request({
+    const response = await this.requestCompatible({
       model: this.config.name,
       messages: [
         { role: 'system', content: this.dreamPushPrompt },
@@ -72,7 +68,7 @@ export class ModelClient {
       ],
       temperature: 0.9,
       max_tokens: Math.min(180, this.config.maxOutputTokens),
-      thinking: { type: 'disabled' }
+      enable_thinking: false
     });
     if (!response.ok) throw new Error(`dream push model request failed: HTTP ${response.status}`);
     const payload = await response.json();
@@ -103,14 +99,10 @@ export class ModelClient {
       ],
       temperature: 0.85,
       max_tokens: Math.min(220, this.config.maxOutputTokens),
-      thinking: { type: 'disabled' },
+      enable_thinking: false,
       response_format: { type: 'json_object' }
     };
-    let response = await this.request(body);
-    if (!response.ok && [400, 422].includes(response.status)) {
-      delete body.response_format;
-      response = await this.request(body);
-    }
+    const response = await this.requestCompatible(body);
     if (!response.ok) throw new Error(`daytime model request failed: HTTP ${response.status}`);
     const payload = await response.json();
     const parsed = parseJson(payload.choices?.[0]?.message?.content ?? '');
@@ -134,7 +126,7 @@ export class ModelClient {
       `最近已发送的跨类型 Bark：${formatRecentMessages(recentMessages)}`,
       rejectedMessage ? `刚被去重器拒绝的候选：${rejectedMessage}。主题和情绪可以不变，但要换一种真实的具体说法。` : ''
     ].join('\n');
-    const response = await this.request({
+    const response = await this.requestCompatible({
       model: this.config.name,
       messages: [
         { role: 'system', content: `你是 ${this.agentName} 持续运行的后台动态状态层。只写一条适合手机通知的自主念头。` },
@@ -142,13 +134,34 @@ export class ModelClient {
       ],
       temperature: 0.9,
       max_tokens: Math.min(240, this.config.maxOutputTokens),
-      thinking: { type: 'disabled' },
+      enable_thinking: false,
       response_format: { type: 'json_object' }
     });
     if (!response.ok) throw new Error(`model request failed: HTTP ${response.status}`);
     const payload = await response.json();
     const parsed = parseJson(payload.choices?.[0]?.message?.content ?? '');
     return { message: String(parsed.message ?? '').slice(0, 900), source: 'model' };
+  }
+
+  async requestCompatible(body) {
+    const attempts = [structuredClone(body)];
+    if (body.response_format) {
+      const withoutJsonMode = structuredClone(body);
+      delete withoutJsonMode.response_format;
+      attempts.push(withoutJsonMode);
+    }
+    const withoutVendorOptions = structuredClone(attempts.at(-1));
+    delete withoutVendorOptions.enable_thinking;
+    delete withoutVendorOptions.thinking;
+    if (JSON.stringify(withoutVendorOptions) !== JSON.stringify(attempts.at(-1))) {
+      attempts.push(withoutVendorOptions);
+    }
+    let response;
+    for (const candidate of attempts) {
+      response = await this.request(candidate);
+      if (response.ok || ![400, 422].includes(response.status)) return response;
+    }
+    return response;
   }
 
   request(body) {
