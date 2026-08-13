@@ -5,6 +5,8 @@ export class OmbreClient {
     this.initializePromise = null;
     this.toolsCache = null;
     this.toolsPromise = null;
+    this.memoryMetadataCache = null;
+    this.memoryMetadataPromise = null;
   }
 
   async post(payload, expectBody = true) {
@@ -165,8 +167,45 @@ export class OmbreClient {
     return parseMemoryMapText(extractText(result));
   }
 
-  async storeDream(dream) {
-    if (!this.config.writeEnabled) return null;
+  async memoryMetadata({ refresh = false } = {}) {
+    const now = Date.now();
+    if (!refresh && this.memoryMetadataCache && now < this.memoryMetadataCache.expiresAt) {
+      return this.memoryMetadataCache.map;
+    }
+    if (!refresh && this.memoryMetadataPromise) return this.memoryMetadataPromise;
+    this.memoryMetadataPromise = (async () => {
+      const map = await this.memoryMap();
+      const byId = new Map((map.stars ?? []).map((star) => [String(star.id), star]));
+      this.memoryMetadataCache = { map: byId, expiresAt: Date.now() + 5 * 60_000 };
+      return byId;
+    })().finally(() => { this.memoryMetadataPromise = null; });
+    return this.memoryMetadataPromise;
+  }
+
+  async surfacedMetadata(text) {
+    const bucketIds = parseSurfacedBucketIds(text);
+    const legacyDomains = parseSurfacedDomains(text);
+    if (!bucketIds.length) return { bucketIds, domains: legacyDomains, tags: [] };
+    let byId;
+    try { byId = await this.memoryMetadata(); }
+    catch { return { bucketIds, domains: legacyDomains, tags: [] }; }
+    const domains = [...legacyDomains];
+    const tags = [];
+    for (const id of bucketIds) {
+      const star = byId.get(id);
+      if (!star) continue;
+      domains.push(...(star.domains ?? []));
+      tags.push(...(star.tags ?? []));
+    }
+    return {
+      bucketIds,
+      domains: [...new Set(domains.map(String).map((value) => value.trim()).filter(Boolean))],
+      tags: [...new Set(tags.map(String).map((value) => value.trim()).filter(Boolean))],
+    };
+  }
+
+  async storeDream(dream, { confirmed = false } = {}) {
+    if (!confirmed && !this.config.writeEnabled) return null;
     const content = [
       `梦境：${dream.dream}`,
       `梦境余韵：${dream.residue}`,
@@ -177,8 +216,12 @@ export class OmbreClient {
     const supported = new Set(Object.keys(holdTool?.inputSchema?.properties ?? {}));
     const candidates = {
       content,
-      tags: 'dream',
-      importance: 7,
+      title: `确认保存的心潮梦境 ${String(dream.createdAt ?? '').slice(0, 10)}`.trim(),
+      tags: '梦境,心潮,非现实',
+      importance: 6,
+      feel: true,
+      why_remembered: confirmed ? '严槿与我明确确认，这个梦值得作为梦境而不是现实事件留下。' : '心潮自动保存的梦境。',
+      meaning: '这是睡眠结算产生的梦境记录，不是现实事件，也不应被当作事实依据。',
       auto: true,
       source: 'xinchao-dream',
     };
@@ -221,6 +264,14 @@ const DRIVE_HINT_MAX_LABELS = 3;
 
 // 从 breath 输出里把每条桶表头的 [domain:...] 解析出来，供记忆共振算亲和度。
 // OB 2.6.5+（breath-meta）在表头带 domain/tags；老输出没有时返回空数组，不影响。
+export function parseSurfacedBucketIds(text) {
+  const ids = [];
+  const re = /\[bucket_id:([A-Za-z0-9_-]{6,120})\]/g;
+  let match;
+  while ((match = re.exec(String(text ?? ''))) !== null) ids.push(match[1]);
+  return [...new Set(ids)];
+}
+
 export function parseSurfacedDomains(text) {
   const domains = [];
   const re = /\[domain:([^\]]*)\]/g;
@@ -231,7 +282,7 @@ export function parseSurfacedDomains(text) {
       if (value) domains.push(value);
     }
   }
-  return domains;
+  return [...new Set(domains)];
 }
 
 function parseMcp(text) {

@@ -6,7 +6,7 @@ import { buildInteractionBridgeMessage } from './interaction-messages.js';
 import { selectUniqueBark } from './bark-dedupe.js';
 import { StateStore } from './state-store.js';
 import { ModelClient } from './model-client.js';
-import { OmbreClient, parseSurfacedDomains } from './ombre-client.js';
+import { OmbreClient } from './ombre-client.js';
 import { BarkClient } from './bark-client.js';
 import { readOmbreHeartbeat } from './heartbeat-store.js';
 import { buildContextEnvelope, contextDeliveryState, recordContextDelivery } from './context-envelope.js';
@@ -73,6 +73,83 @@ async function updateState(meta, mutate) {
     log('transition_journal_failed', { type: meta.type, message: error.message });
   }
   return after;
+}
+
+async function applyResonanceFromMaterial(state, material, kind, now = new Date()) {
+  if (!config.resonance.enabled || !material) return state;
+  const metadata = await ombre.surfacedMetadata(material);
+  if (!metadata.domains.length) return state;
+  const updated = await updateState({
+    type: 'memory_resonance',
+    source: 'resonance',
+    details: {
+      kind,
+      bucketIds: metadata.bucketIds.slice(0, 8).join(','),
+      domains: metadata.domains.slice(0, 8).join(','),
+    },
+    at: now,
+  }, (latest) => applyMemoryResonance(latest, metadata.domains, now, config.resonance).state);
+  log('memory_resonance', {
+    kind,
+    buckets: metadata.bucketIds.length,
+    domains: metadata.domains.length,
+    revision: updated.revision,
+  });
+  return updated;
+}
+
+async function pendingDreams() {
+  const state = await store.read();
+  return (state.recentDreams ?? [])
+    .filter((dream) => dream?.id && !dream.ombreBucketId)
+    .slice(-12)
+    .reverse()
+    .map((dream) => ({
+      id: dream.id,
+      createdAt: dream.createdAt ?? null,
+      source: dream.source ?? 'unknown',
+      dream: dream.dream ?? '',
+      residue: dream.residue ?? '',
+      awareness: dream.awareness ?? '',
+    }));
+}
+
+const dreamConfirmationPromises = new Map();
+
+async function confirmDreamMemory({ dreamId }) {
+  if (dreamConfirmationPromises.has(dreamId)) return dreamConfirmationPromises.get(dreamId);
+  const operation = (async () => {
+    const before = await store.read();
+    const dream = (before.recentDreams ?? []).find((item) => item?.id === dreamId);
+    if (!dream) throw new Error('找不到这个 dream_id；请先调用“查看待确认梦境”');
+    if (dream.ombreBucketId) {
+      return { dreamId, bucketId: dream.ombreBucketId, alreadySaved: true, revision: before.revision };
+    }
+    const bucketId = await ombre.storeDream(dream, { confirmed: true });
+    if (!bucketId) throw new Error('OB 已响应，但没有返回可确认的 bucket_id；为避免误判，本次不标记成功');
+    let alreadySaved = false;
+    const state = await updateState({
+      type: 'dream_confirmed_to_ombre',
+      source: 'explicit-confirmation',
+      details: { dreamId, bucketId },
+      at: new Date(),
+    }, (current) => {
+      const target = (current.recentDreams ?? []).find((item) => item?.id === dreamId);
+      if (!target) throw new Error('写回状态时找不到这个 dream_id');
+      if (target.ombreBucketId) {
+        alreadySaved = true;
+        return current;
+      }
+      target.ombreBucketId = bucketId;
+      target.confirmedToOmbreAt = new Date().toISOString();
+      current.revision += 1;
+      return current;
+    });
+    log('dream_confirmed_to_ombre', { dreamId, bucketId, revision: state.revision });
+    return { dreamId, bucketId, alreadySaved, revision: state.revision };
+  })().finally(() => dreamConfirmationPromises.delete(dreamId));
+  dreamConfirmationPromises.set(dreamId, operation);
+  return operation;
 }
 
 async function synchronizeOmbreHeartbeat() {
@@ -238,16 +315,8 @@ async function runCycle() {
         catch (error) { log('ombre_read_failed', { message: error.message }); }
       }
       if (config.resonance.enabled && thoughtMaterial) {
-        const domains = parseSurfacedDomains(thoughtMaterial);
-        if (domains.length) {
-          state = await updateState({
-            type: 'memory_resonance',
-            source: 'resonance',
-            details: { kind: 'autonomous_thought', domains: domains.slice(0, 8).join(',') },
-            at: now,
-          }, (latest) => applyMemoryResonance(latest, domains, now, config.resonance).state);
-          log('memory_resonance', { kind: 'autonomous_thought', domains: domains.length, revision: state.revision });
-        }
+        try { state = await applyResonanceFromMaterial(state, thoughtMaterial, 'autonomous_thought', now); }
+        catch (error) { log('memory_resonance_failed', { kind: 'autonomous_thought', message: error.message }); }
       }
       try {
         selected = await selectUniqueBark({
@@ -312,16 +381,8 @@ async function runCycle() {
       try {
         const material = await ombre.daytimeMaterial(topDrives(state));
         if (config.resonance.enabled && material) {
-          const domains = parseSurfacedDomains(material);
-          if (domains.length) {
-            state = await updateState({
-              type: 'memory_resonance',
-              source: 'resonance',
-              details: { kind: 'daytime_emergence', domains: domains.slice(0, 8).join(',') },
-              at: now,
-            }, (latest) => applyMemoryResonance(latest, domains, now, config.resonance).state);
-            log('memory_resonance', { kind: 'daytime_emergence', domains: domains.length, revision: state.revision });
-          }
+          try { state = await applyResonanceFromMaterial(state, material, 'daytime_emergence', now); }
+          catch (error) { log('memory_resonance_failed', { kind: 'daytime_emergence', message: error.message }); }
         }
         if (material.trim()) {
           selected = await selectUniqueBark({
@@ -586,6 +647,8 @@ async function createContextEnvelope({
   ) {
     try {
       ombreText = await ombre.recentContinuityMaterial(config.context.ombreMaxTokens);
+      try { state = await applyResonanceFromMaterial(state, ombreText, 'context_continuity', now); }
+      catch (error) { log('memory_resonance_failed', { kind: 'context_continuity', message: error.message }); }
     } catch (error) {
       ombreWarning = 'ombre_unavailable';
       log('context_ombre_read_failed', { message: error.message });
@@ -1028,6 +1091,8 @@ const server = createServer(async (request, response) => {
           };
         },
         handoffNote: async (note) => saveHandoffNote(note, 'mcp'),
+        pendingDreams,
+        confirmDream: confirmDreamMemory,
         cabinInbox: async () => cabin.unlockedUserNotes(),
         cabinNote: async (note) => cabin.addNote({ ...note, from: 'ai', locked: false }),
         // 心潮念网关：把 OB 记忆工具经心潮同一端点暴露/转发。

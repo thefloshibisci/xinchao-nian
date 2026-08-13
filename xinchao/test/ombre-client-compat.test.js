@@ -82,6 +82,6 @@ test('dream writes omit legacy fields unsupported by current Ombre hold', async 
   await ombre.storeDream({ dream: '海', residue: '潮声', awareness: '醒来' });
   assert.equal(called.name, 'hold');
   assert.deepEqual(Object.keys(called.args).sort(), ['content', 'importance', 'tags']);
-  assert.equal(called.args.tags, 'dream');
-  assert.equal(called.args.importance, 7);
+  assert.equal(called.args.tags, '梦境,心潮,非现实');
+  assert.equal(called.args.importance, 6);
 });

@@ -197,6 +197,42 @@ export const XINCHAO_TOOLS = [
     },
   },
   {
+    name: 'xinchao_dreams_pending',
+    title: '查看待确认梦境',
+    description: '查看心潮近期尚未写入长期记忆的梦。梦只是睡眠结算的内在材料，不是现实事件；此工具只读，不会自动保存。',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: 'xinchao_dream_confirm',
+    title: '确认梦境写入记忆',
+    description: [
+      '仅在用户或 AI 明确判断某个待确认梦境值得长期保留时调用。',
+      '必须传入待确认列表中的 dream_id，并显式传 confirm=true。',
+      '保存内容会标明“梦境、非现实”，并从普通 breath 浮现中隐藏；重复确认同一个梦不会重复写入。',
+    ].join(''),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dream_id: { type: 'string', minLength: 1, maxLength: 120 },
+        confirm: { type: 'boolean', description: '必须明确为 true，表示已经完成人工判断。' },
+      },
+      required: ['dream_id', 'confirm'],
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
     name: 'xinchao_cabin_inbox',
     title: '读取已解锁的小屋来信',
     description: '读取用户在小屋里明确开锁、允许 AI 查看的人类来信。上锁的信不会返回正文，也不能绕过锁读取。',
@@ -325,6 +361,13 @@ function handoffNoteArgs(args = {}, fallbackSessionId = '') {
   };
 }
 
+function dreamConfirmArgs(args = {}) {
+  const dreamId = String(args.dream_id ?? '').trim().slice(0, 120);
+  if (!dreamId) throw new Error('dream_id 是必填项');
+  if (args.confirm !== true) throw new Error('只有明确完成判断后才能保存：请显式传 confirm=true');
+  return { dreamId, confirmed: true };
+}
+
 function cabinNoteArgs(args = {}) {
   const eventId = String(args.event_id ?? '').trim().slice(0, 120);
   if (eventId.length < 8) throw new Error('event_id 至少需要 8 个字符');
@@ -358,6 +401,27 @@ async function callTool(name, args, handlers) {
     const duplicate = result.duplicate ? ' duplicate=true' : '';
     return toolText(
       `近期交接便签已接收：revision=${result.revision}${duplicate}`,
+      result,
+    );
+  }
+  if (name === 'xinchao_dreams_pending') {
+    const dreams = await handlers.pendingDreams();
+    const text = dreams.length
+      ? dreams.map((dream) => [
+          `[dream_id:${dream.id}] ${dream.createdAt ?? ''}`.trim(),
+          dream.dream ? `梦境：${dream.dream}` : '',
+          dream.residue ? `余韵：${dream.residue}` : '',
+          dream.awareness ? `醒后意识：${dream.awareness}` : '',
+        ].filter(Boolean).join('\n')).join('\n\n---\n\n')
+      : '目前没有尚待确认的梦境。';
+    return toolText(text, { dreams });
+  }
+  if (name === 'xinchao_dream_confirm') {
+    const result = await handlers.confirmDream(dreamConfirmArgs(args));
+    return toolText(
+      result.alreadySaved
+        ? `这个梦已经保存过：dream=${result.dreamId} bucket=${result.bucketId}`
+        : `梦境已在明确确认后写入长期记忆：dream=${result.dreamId} bucket=${result.bucketId}`,
       result,
     );
   }
@@ -411,6 +475,7 @@ export async function handleMcpMessage(payload, handlers) {
           '新窗口开始时调用 xinchao_context；服务端会绑定当前 MCP 连接，无需自行编写 session_id。',
           '一次实际互动后可调用 xinchao_event 更新窗口短状态；event_id 必须唯一，重试时复用。',
           '需要换窗续接时可调用 xinchao_handoff_note 保存近期进度摘要；不要提交聊天原文或人物基岩。',
+          '可用 xinchao_dreams_pending 查看待确认梦境；只有明确判断值得留下时，才用 xinchao_dream_confirm 并传 confirm=true。',
           '用户开锁后可用 xinchao_cabin_inbox 读取小屋来信；上锁的正文不会返回。你想给用户留话时可用 xinchao_cabin_note。',
           '只有结果明确的真实互动才填写 interaction_type；不要提交聊天正文或欲望数值。',
         ].join(''),

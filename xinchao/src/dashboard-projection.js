@@ -82,6 +82,8 @@ function projectedDreams(state, includePrivateText, limit = 12) {
       hasSummary: Boolean(summary),
       hasAwareness: Boolean(compact(dream?.awareness)),
       lucidity,
+      savedToOmbre: Boolean(dream?.ombreBucketId),
+      ombreBucketId: compact(dream?.ombreBucketId, 120) || null,
       ...(includePrivateText ? {
         dream: compact(dream?.dream, 4000) || null,
         summary,
