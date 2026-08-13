@@ -3,6 +3,8 @@ export class OmbreClient {
     this.config = config;
     this.sessionId = null;
     this.initializePromise = null;
+    this.toolsCache = null;
+    this.toolsPromise = null;
   }
 
   async post(payload, expectBody = true) {
@@ -62,57 +64,87 @@ export class OmbreClient {
   // 网关用：拉 OB 的 tools/list（供心潮念合并暴露 OB 记忆工具）。
   // 带会话刷新重试——OB 重启后旧 session 失效，第一次会失败；不重试的话 tools/list 会
   // 瞬态只剩心潮 3 个工具（OB 工具消失），直到下次拉取。tools/list 只读、重试安全。
-  async listTools() {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        await this.initialize();
-        const raw = await this.post({ jsonrpc: '2.0', id: Date.now(), method: 'tools/list', params: {} });
-        return raw?.result?.tools ?? raw?.tools ?? [];
-      } catch (error) {
-        this.sessionId = null;
-        if (attempt) throw error;
+  async listTools({ refresh = false } = {}) {
+    if (!refresh && this.toolsCache) return this.toolsCache;
+    if (!refresh && this.toolsPromise) return this.toolsPromise;
+    this.toolsPromise = (async () => {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          await this.initialize();
+          const raw = await this.post({ jsonrpc: '2.0', id: Date.now(), method: 'tools/list', params: {} });
+          const tools = raw?.result?.tools ?? raw?.tools ?? [];
+          this.toolsCache = Array.isArray(tools) ? tools : [];
+          return this.toolsCache;
+        } catch (error) {
+          this.sessionId = null;
+          if (attempt) throw error;
+        }
       }
+      return [];
+    })().finally(() => { this.toolsPromise = null; });
+    return this.toolsPromise;
+  }
+
+  async toolInfo(name) {
+    return (await this.listTools()).find((tool) => tool?.name === name) ?? null;
+  }
+
+  // Ombre Brain 2.6.x used a parameterised `breath`; newer releases split it
+  // into zero-argument breath + breath_search + breath_advanced. Discover the
+  // remote schema instead of pinning Xinchao to either OB release line.
+  async callBreath({ query, maxResults, maxTokens }) {
+    const tools = await this.listTools();
+    const names = new Set(tools.map((tool) => tool?.name));
+    if (names.has('breath_advanced')) {
+      return this.call('breath_advanced', {
+        query,
+        max_results: maxResults,
+        max_tokens: maxTokens,
+      });
     }
-    return [];
+    if (names.has('breath_search')) {
+      return this.call('breath_search', { query, max_results: maxResults });
+    }
+    return this.call('breath', { query, max_results: maxResults, max_tokens: maxTokens });
   }
 
   async recentMaterial(drives = []) {
-    const result = await this.call('breath', {
+    const result = await this.callBreath({
       query: withDriveHint('近期重要记忆、情绪、关系变化和未完成事项', drives),
-      max_results: this.config.breathMaxResults,
-      max_tokens: this.config.breathMaxTokens
+      maxResults: this.config.breathMaxResults,
+      maxTokens: this.config.breathMaxTokens
     });
     return extractText(result).slice(0, 10000);
   }
 
   async daytimeMaterial(drives = []) {
-    const result = await this.call('breath', {
+    const result = await this.callBreath({
       query: withDriveHint('白天自然浮现的近期记忆、具体细节、未说完的话和当下牵挂；不要返回系统配置或技术信息', drives),
-      max_results: this.config.breathMaxResults,
-      max_tokens: this.config.breathMaxTokens
+      maxResults: this.config.breathMaxResults,
+      maxTokens: this.config.breathMaxTokens
     });
     return extractText(result).slice(0, 10000);
   }
 
   // 自主念头用的材料：比日间浮现更短，只要能让念头落到具体的事上。
   async thoughtMaterial(drives = []) {
-    const result = await this.call('breath', {
+    const result = await this.callBreath({
       query: withDriveHint('此刻自然想起的一件具体的事：最近的共同经历、说过的话或还惦记着的东西；不要返回系统配置、部署或技术信息', drives),
-      max_results: Math.max(1, Math.min(3, Number(this.config.breathMaxResults) || 2)),
-      max_tokens: Math.max(200, Math.min(600, Number(this.config.breathMaxTokens) || 400))
+      maxResults: Math.max(1, Math.min(3, Number(this.config.breathMaxResults) || 2)),
+      maxTokens: Math.max(200, Math.min(600, Number(this.config.breathMaxTokens) || 400))
     });
     return extractText(result).slice(0, 4000);
   }
 
   async recentContinuityMaterial(maxTokens = this.config.breathMaxTokens) {
-    const result = await this.call('breath', {
+    const result = await this.callBreath({
       query: [
         '新窗口近期连续性：只返回最近发生了什么，以及仍直接影响现在的人物与关系变化、生活重点和未完成约定。',
         '不要返回核心准则、自我基岩或长期画像；这些由客户端从自己的核心指令和长期记忆单独完整读取。',
         '不要返回部署、代码、接口、密钥、系统日志或已经过期的技术待办。',
       ].join(''),
-      max_results: Math.max(3, Math.min(8, Number(this.config.breathMaxResults) || 3)),
-      max_tokens: Math.max(200, Math.min(3000, Number(maxTokens) || 1600)),
+      maxResults: Math.max(3, Math.min(8, Number(this.config.breathMaxResults) || 3)),
+      maxTokens: Math.max(200, Math.min(3000, Number(maxTokens) || 1600)),
     });
     return extractText(result).slice(0, 16000);
   }
@@ -140,13 +172,21 @@ export class OmbreClient {
       `醒后意识：${dream.awareness}`,
       '说明：这是睡眠结算产生的梦境，不是现实事件；调用外部记忆服务不等于醒来。'
     ].join('\n');
-    const result = await this.call('hold', {
+    const holdTool = await this.toolInfo('hold');
+    const supported = new Set(Object.keys(holdTool?.inputSchema?.properties ?? {}));
+    const candidates = {
       content,
       tags: 'dream',
       importance: 7,
       auto: true,
       source: 'xinchao-dream',
-    });
+    };
+    // Keep compatibility with current OB, whose public hold no longer accepts
+    // the legacy auto/source fields. Unknown fields are never sent.
+    const args = supported.size
+      ? Object.fromEntries(Object.entries(candidates).filter(([key]) => supported.has(key)))
+      : candidates;
+    const result = await this.call('hold', args);
     const text = extractText(result);
     const bucketId = text.match(/[a-f0-9]{12,}/i)?.[0] ?? null;
     // 梦是睡眠结算的残渣，不该作为真实记忆回到 breath（否则下次梦引擎会把旧梦当素材捞出 → 梦吃梦）。
