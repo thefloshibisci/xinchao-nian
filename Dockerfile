@@ -1,3 +1,4 @@
+# rebuild 20260813
 # Standalone Xinchao image. This intentionally does not bundle Ombre Brain:
 # connect an independently updatable OB deployment through OMBRE_MCP_URL.
 FROM node:20-alpine
