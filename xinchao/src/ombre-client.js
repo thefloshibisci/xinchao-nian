@@ -28,7 +28,7 @@ export class OmbreClient {
   }
 
   async initialize() {
-    if (this.sessionId) return;
+    if (this.sessionId || this._initialized) return;
     if (!this.initializePromise) {
       this.initializePromise = (async () => {
         await this.post({
@@ -41,7 +41,8 @@ export class OmbreClient {
             clientInfo: { name: 'xinchao-dynamic-mind', version: '2.4.0' },
           },
         });
-        if (!this.sessionId) throw new Error('Ombre MCP did not return a session id');
+        // OB 1.28.x does not return Mcp-Session-Id; proceed sessionless.
+        this._initialized = true;
         await this.post({ jsonrpc: '2.0', method: 'notifications/initialized' }, false);
       })().finally(() => { this.initializePromise = null; });
     }
@@ -61,9 +62,9 @@ export class OmbreClient {
     throw new Error('Ombre MCP call failed after session refresh');
   }
 
-  // 网关用：拉 OB 的 tools/list（供心潮念合并暴露 OB 记忆工具）。
-  // 带会话刷新重试——OB 重启后旧 session 失效，第一次会失败；不重试的话 tools/list 会
-  // 瞬态只剩心潮 3 个工具（OB 工具消失），直到下次拉取。tools/list 只读、重试安全。
+  // 网关用：�?OB �?tools/list（供心潮念合并暴�?OB 记忆工具）�?
+  // 带会话刷新重试——OB 重启后旧 session 失效，第一次会失败；不重试的话 tools/list �?
+  // 瞬态只剩心�?3 个工具（OB 工具消失），直到下次拉取。tools/list 只读、重试安全�?
   async listTools({ refresh = false } = {}) {
     if (!refresh && this.toolsCache) return this.toolsCache;
     if (!refresh && this.toolsPromise) return this.toolsPromise;
@@ -110,7 +111,7 @@ export class OmbreClient {
 
   async recentMaterial(drives = []) {
     const result = await this.callBreath({
-      query: withDriveHint('近期重要记忆、情绪、关系变化和未完成事项', drives),
+      query: withDriveHint('近期重要记忆、情绪、关系变化和未完成事�?, drives),
       maxResults: this.config.breathMaxResults,
       maxTokens: this.config.breathMaxTokens
     });
@@ -119,17 +120,17 @@ export class OmbreClient {
 
   async daytimeMaterial(drives = []) {
     const result = await this.callBreath({
-      query: withDriveHint('白天自然浮现的近期记忆、具体细节、未说完的话和当下牵挂；不要返回系统配置或技术信息', drives),
+      query: withDriveHint('白天自然浮现的近期记忆、具体细节、未说完的话和当下牵挂；不要返回系统配置或技术信�?, drives),
       maxResults: this.config.breathMaxResults,
       maxTokens: this.config.breathMaxTokens
     });
     return extractText(result).slice(0, 10000);
   }
 
-  // 自主念头用的材料：比日间浮现更短，只要能让念头落到具体的事上。
+  // 自主念头用的材料：比日间浮现更短，只要能让念头落到具体的事上�?
   async thoughtMaterial(drives = []) {
     const result = await this.callBreath({
-      query: withDriveHint('此刻自然想起的一件具体的事：最近的共同经历、说过的话或还惦记着的东西；不要返回系统配置、部署或技术信息', drives),
+      query: withDriveHint('此刻自然想起的一件具体的事：最近的共同经历、说过的话或还惦记着的东西；不要返回系统配置、部署或技术信�?, drives),
       maxResults: Math.max(1, Math.min(3, Number(this.config.breathMaxResults) || 2)),
       maxTokens: Math.max(200, Math.min(600, Number(this.config.breathMaxTokens) || 400))
     });
@@ -139,9 +140,9 @@ export class OmbreClient {
   async recentContinuityMaterial(maxTokens = this.config.breathMaxTokens) {
     const result = await this.callBreath({
       query: [
-        '新窗口近期连续性：只返回最近发生了什么，以及仍直接影响现在的人物与关系变化、生活重点和未完成约定。',
-        '不要返回核心准则、自我基岩或长期画像；这些由客户端从自己的核心指令和长期记忆单独完整读取。',
-        '不要返回部署、代码、接口、密钥、系统日志或已经过期的技术待办。',
+        '新窗口近期连续性：只返回最近发生了什么，以及仍直接影响现在的人物与关系变化、生活重点和未完成约定�?,
+        '不要返回核心准则、自我基岩或长期画像；这些由客户端从自己的核心指令和长期记忆单独完整读取�?,
+        '不要返回部署、代码、接口、密钥、系统日志或已经过期的技术待办�?,
       ].join(''),
       maxResults: Math.max(3, Math.min(8, Number(this.config.breathMaxResults) || 3)),
       maxTokens: Math.max(200, Math.min(3000, Number(maxTokens) || 1600)),
@@ -155,9 +156,9 @@ export class OmbreClient {
     return this.recentContinuityMaterial(maxTokens);
   }
 
-  // 网页记忆星图只读取 pulse 暴露的桶元数据，不读取正文。公开版当前的
-  // pulse 是人类可读文本；未来融合版若直接返回结构化 JSON，同一适配器也
-  // 会保留 driveSnapshot / driveAffinity 等 3.0 可选字段。
+  // 网页记忆星图只读�?pulse 暴露的桶元数据，不读取正文。公开版当前的
+  // pulse 是人类可读文本；未来融合版若直接返回结构�?JSON，同一适配器也
+  // 会保�?driveSnapshot / driveAffinity �?3.0 可选字段�?
   async memoryMap() {
     if (!this.config.readEnabled) return emptyMemoryMap('not_configured');
     const result = await this.call('pulse', {});
@@ -167,10 +168,10 @@ export class OmbreClient {
   async storeDream(dream) {
     if (!this.config.writeEnabled) return null;
     const content = [
-      `梦境：${dream.dream}`,
-      `梦境余韵：${dream.residue}`,
-      `醒后意识：${dream.awareness}`,
-      '说明：这是睡眠结算产生的梦境，不是现实事件；调用外部记忆服务不等于醒来。'
+      `梦境�?{dream.dream}`,
+      `梦境余韵�?{dream.residue}`,
+      `醒后意识�?{dream.awareness}`,
+      '说明：这是睡眠结算产生的梦境，不是现实事件；调用外部记忆服务不等于醒来�?
     ].join('\n');
     const holdTool = await this.toolInfo('hold');
     const supported = new Set(Object.keys(holdTool?.inputSchema?.properties ?? {}));
@@ -189,8 +190,8 @@ export class OmbreClient {
     const result = await this.call('hold', args);
     const text = extractText(result);
     const bucketId = text.match(/[a-f0-9]{12,}/i)?.[0] ?? null;
-    // 梦是睡眠结算的残渣，不该作为真实记忆回到 breath（否则下次梦引擎会把旧梦当素材捞出 → 梦吃梦）。
-    // 出生即标 dont_surface=1：仍存在 OB、仍显示在梦境页（来自心潮 state），但不进 breath 召回。
+    // 梦是睡眠结算的残渣，不该作为真实记忆回到 breath（否则下次梦引擎会把旧梦当素材捞�?�?梦吃梦）�?
+    // 出生即标 dont_surface=1：仍存在 OB、仍显示在梦境页（来自心�?state），但不�?breath 召回�?
     if (bucketId) {
       try { await this.call('trace', { bucket_id: bucketId, dont_surface: 1 }); }
       catch (error) { /* best-effort：标记失败不阻断存梦本身 */ }
@@ -199,12 +200,12 @@ export class OmbreClient {
   }
 }
 
-// 把当前最强的几个驱动力拼进 breath 的 query，让"此刻想什么"影响"想起什么"。
+// 把当前最强的几个驱动力拼�?breath �?query，让"此刻想什�?影响"想起什�?�?
 //
-// 这里只改排序，不改准入：能不能返回仍然由 Ombre 的 admission gate 判定
+// 这里只改排序，不改准入：能不能返回仍然由 Ombre �?admission gate 判定
 // （要有原句、词锚或高语义证据）。所以驱动力高不会凭空造出记忆，只会让
-// 本来就有证据的那几条里，跟当下状态相关的先浮上来。末尾那句兜底很重要，
-// 没有它的话强驱动力会把召回卡死成空。
+// 本来就有证据的那几条里，跟当下状态相关的先浮上来。末尾那句兜底很重要�?
+// 没有它的话强驱动力会把召回卡死成空�?
 function withDriveHint(base, drives) {
   const labels = (Array.isArray(drives) ? drives : [])
     .filter((item) => Number(item?.value) >= DRIVE_HINT_MIN)
@@ -212,14 +213,14 @@ function withDriveHint(base, drives) {
     .map((item) => String(item?.label ?? '').trim())
     .filter(Boolean);
   if (!labels.length) return base;
-  return `${base}。此刻最强的内在状态是${labels.join('、')}，优先浮现与之真正相关的具体记忆；没有直接相关的就照常返回近期重要的`;
+  return `${base}。此刻最强的内在状态是${labels.join('�?)}，优先浮现与之真正相关的具体记忆；没有直接相关的就照常返回近期重要的`;
 }
 
 const DRIVE_HINT_MIN = 0.5;
 const DRIVE_HINT_MAX_LABELS = 3;
 
-// 从 breath 输出里把每条桶表头的 [domain:...] 解析出来，供记忆共振算亲和度。
-// OB 2.6.5+（breath-meta）在表头带 domain/tags；老输出没有时返回空数组，不影响。
+// �?breath 输出里把每条桶表头的 [domain:...] 解析出来，供记忆共振算亲和度�?
+// OB 2.6.5+（breath-meta）在表头�?domain/tags；老输出没有时返回空数组，不影响�?
 export function parseSurfacedDomains(text) {
   const domains = [];
   const re = /\[domain:([^\]]*)\]/g;
@@ -362,7 +363,7 @@ export function parseMemoryMapText(raw) {
   const text = String(raw ?? '').trim();
   if (!text) return emptyMemoryMap('empty');
 
-  // 3.0 结构化输出优先；公开版旧 pulse 继续走下方无损文本适配。
+  // 3.0 结构化输出优先；公开版旧 pulse 继续走下方无损文本适配�?
   try {
     const parsed = JSON.parse(text);
     const sourceStars = parsed.stars ?? parsed.nodes;
@@ -387,11 +388,11 @@ export function parseMemoryMapText(raw) {
       };
     }
   } catch {
-    // 人类可读 pulse 不是 JSON，继续解析；不把解析失败当服务故障。
+    // 人类可读 pulse 不是 JSON，继续解析；不把解析失败当服务故障�?
   }
 
   const stats = {};
-  for (const [key, label] of [['pinned', '固化桶'], ['dynamic', '动态桶'], ['archived', '归档桶']]) {
+  for (const [key, label] of [['pinned', '固化�?], ['dynamic', '动态桶'], ['archived', '归档�?]]) {
     const match = text.match(new RegExp(`${label}[:：]\\s*(\\d+)`));
     if (match) stats[key] = Number(match[1]);
   }
@@ -399,7 +400,7 @@ export function parseMemoryMapText(raw) {
   if (size) stats.size = size[1];
 
   const stars = [];
-  const line = /((?:\uD83D\uDCCC)?)\s*\[([0-9a-f]+)\]\s*《([^》]*)》([^\n]*)/gi;
+  const line = /((?:\uD83D\uDCCC)?)\s*\[([0-9a-f]+)\]\s*�?[^》]*)�?[^\n]*)/gi;
   let match;
   while ((match = line.exec(text)) !== null) {
     const [, pin, id, title, tail] = match;
