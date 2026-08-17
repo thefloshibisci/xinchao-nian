@@ -750,7 +750,22 @@ async function createContextEnvelope({
 }) {
   let state = await store.read();
   const delivery = contextDeliveryState(state, sessionId, mode, now, config.context.handoffOnceHours);
-  let ombreText = '';,  let ombreWarning = '';,  let recentText = '';,  let continuityWarning = '';,  if (config.continuity.enabled) {,    try {,      recentText = renderRecentTurns(await continuityStore.read(), {,        profileId: config.continuity.profileId,,        limit: config.continuity.maxContextTurns,,        now,,      });,    } catch (error) {,      continuityWarning = 'recent_continuity_unavailable';,      log('recent_continuity_read_failed', { message: error.message });,    },  }
+  let ombreText = '';
+  let ombreWarning = '';
+  let recentText = '';
+  let continuityWarning = '';
+  if (config.continuity.enabled) {
+    try {
+      recentText = renderRecentTurns(await continuityStore.read(), {
+        profileId: config.continuity.profileId,
+        limit: config.continuity.maxContextTurns,
+        now,
+      });
+    } catch (error) {
+      continuityWarning = 'recent_continuity_unavailable';
+      log('recent_continuity_read_failed', { message: error.message });
+    }
+  }
   if (
     mode === 'session_start'
     && (!delivery.alreadyDelivered || force)
