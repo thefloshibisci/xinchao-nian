@@ -3,11 +3,13 @@ function bool(name, fallback = false) {
   return raw == null ? fallback : ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase());
 }
 
+
 function number(name, fallback, min, max) {
   const parsed = Number(process.env[name] ?? fallback);
   if (!Number.isFinite(parsed)) throw new Error(`${name} must be numeric`);
   return Math.max(min, Math.min(max, parsed));
 }
+
 
 export function loadConfig() {
   const agentName = process.env.AGENT_NAME ?? 'AI 助手';
@@ -51,6 +53,13 @@ export function loadConfig() {
       writeEnabled: bool('OMBRE_WRITE_ENABLED', false),
       breathMaxResults: number('OMBRE_BREATH_MAX_RESULTS', 3, 1, 10),
       breathMaxTokens: number('OMBRE_BREATH_MAX_TOKENS', 800, 200, 3000)
+    },
+    continuity: {
+      enabled: bool('RECENT_CONTINUITY_ENABLED', false),
+      statePath: process.env.RECENT_CONTINUITY_STATE_PATH ?? '/app/state/recent-continuity.json',
+      profileId: process.env.RECENT_CONTINUITY_PROFILE_ID ?? 'default',
+      ttlHours: number('RECENT_CONTINUITY_TTL_HOURS', 24, 1, 168),
+      maxContextTurns: number('RECENT_CONTINUITY_MAX_CONTEXT_TURNS', 8, 1, 24),
     },
     context: {
       enabled: bool('CONTEXT_ENVELOPE_ENABLED', true),
@@ -167,6 +176,7 @@ export function loadConfig() {
   };
 }
 
+
 export function validateConfig(config) {
   const externalMemoryEnabled = Boolean(
     config.ombre.readEnabled
@@ -214,5 +224,3 @@ export function validateConfig(config) {
   }
   return config;
 }
-
-
