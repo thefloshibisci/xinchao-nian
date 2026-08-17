@@ -13,12 +13,16 @@ const INTERACTION_TYPES = new Set([
 ]);
 
 
+
+
 // 心潮念网关：对外暴露的 OB 记忆工具（精简集，purge/restore/letter/plan 不暴露）。
 // hold 保留（2026-08-09 复议：hold 有了 meaning 字段能补上下文，与 grow 不冲突——
 // 日常/日记整理走 grow，重要瞬间可用 hold 但必须写 meaning）。
 // 走代理转发到 OB；schema 在 tools/list 时动态从 OB 拉，永不漂移。
 export const OB_PROXY_TOOLS = ['breath', 'hold', 'grow', 'trace', 'forget', 'dream', 'anchor', 'release', 'I', 'pulse'];
 const OB_PROXY_SET = new Set(OB_PROXY_TOOLS);
+
+
 
 
 // 对外用中文标题 + 中文说明（内部名保持不变，用于协议路由）。让顾川看到的是"浮现记忆"而不是"breath"。
@@ -38,6 +42,8 @@ function relabelOb(tool) {
   const lab = OB_TOOL_LABELS[tool?.name];
   return lab ? { ...tool, title: lab.title, description: lab.description } : tool;
 }
+
+
 
 
 export const XINCHAO_TOOLS = [
@@ -316,14 +322,20 @@ export const XINCHAO_TOOLS = [
 ];
 
 
+
+
 function response(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
 
 
+
+
 function errorResponse(id, code, message) {
   return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
 }
+
+
 
 
 function toolText(value, structuredContent = null) {
@@ -338,6 +350,8 @@ function toolText(value, structuredContent = null) {
 }
 
 
+
+
 function toolError(message) {
   return {
     content: [{ type: 'text', text: String(message || '工具执行失败') }],
@@ -346,10 +360,14 @@ function toolError(message) {
 }
 
 
+
+
 function requestedProtocol(params = {}) {
   const value = String(params.protocolVersion ?? '');
   return SUPPORTED_PROTOCOLS.has(value) ? value : '2025-06-18';
 }
+
+
 
 
 function numberOr(value, fallback) {
@@ -358,9 +376,13 @@ function numberOr(value, fallback) {
 }
 
 
+
+
 function stableSessionId(args = {}, fallbackSessionId = '') {
   return String(args.session_id ?? fallbackSessionId ?? '').trim().slice(0, 120);
 }
+
+
 
 
 function contextArgs(args = {}, fallbackSessionId = '') {
@@ -374,6 +396,8 @@ function contextArgs(args = {}, fallbackSessionId = '') {
     force: Boolean(args.force),
   };
 }
+
+
 
 
 function eventArgs(args = {}, fallbackSessionId = '') {
@@ -399,6 +423,8 @@ function eventArgs(args = {}, fallbackSessionId = '') {
 }
 
 
+
+
 function handoffNoteArgs(args = {}, fallbackSessionId = '') {
   const sessionId = stableSessionId(args, fallbackSessionId);
   if (!sessionId) throw new Error('session_id 是必填项');
@@ -413,6 +439,8 @@ function handoffNoteArgs(args = {}, fallbackSessionId = '') {
     ttlHours: Math.max(1, Math.min(168, numberOr(args.ttl_hours, 72))),
   };
 }
+
+
 
 
 function continuitySyncArgs(args = {}, fallbackSessionId = '') {
@@ -432,12 +460,15 @@ function continuitySyncArgs(args = {}, fallbackSessionId = '') {
   return { sessionId, client, messages, limit: Math.max(1, Math.min(24, numberOr(args.limit, 8))) };
 }
 
+
 function dreamConfirmArgs(args = {}) {
   const dreamId = String(args.dream_id ?? '').trim().slice(0, 120);
   if (!dreamId) throw new Error('dream_id 是必填项');
   if (args.confirm !== true) throw new Error('只有明确完成判断后才能保存：请显式传 confirm=true');
   return { dreamId, confirmed: true };
 }
+
+
 
 
 function cabinNoteArgs(args = {}) {
@@ -447,6 +478,8 @@ function cabinNoteArgs(args = {}) {
   if (!content) throw new Error('content 是必填项');
   return { eventId, content, timestamp: args.timestamp ?? null };
 }
+
+
 
 
 async function callTool(name, args, handlers) {
@@ -529,6 +562,8 @@ async function callTool(name, args, handlers) {
 }
 
 
+
+
 export async function handleMcpMessage(payload, handlers) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return { status: 400, body: errorResponse(null, -32600, 'Invalid Request') };
@@ -575,7 +610,7 @@ export async function handleMcpMessage(payload, handlers) {
         const curated = (Array.isArray(obTools) ? obTools : [])
           .filter((t) => OB_PROXY_SET.has(t?.name))
           .map(relabelOb);
-        tools = [...XINCHAO_TOOLS, ...curated];
+        tools = [...tools, ...curated];
       }
     } catch (error) {
       // OB 不可达时只暴露心潮工具，绝不让 tools/list 失败（否则连接器整个挂掉）。
