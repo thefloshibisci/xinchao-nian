@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createInitialState, dreamAllowed, recordDream } from '../src/engine.js';
+import { newState, dreamAllowed, recordDream } from '../src/engine.js';
 
 const window = { enabled: true, timeZone: 'Asia/Shanghai', startHour: 3, endHour: 5 };
 function sleeping() {
-  const state = createInitialState(new Date('2026-08-16T16:00:00.000Z'));
+  const state = newState(new Date('2026-08-16T16:00:00.000Z'));
   state.consciousness = 'sleeping';
   return state;
 }
