@@ -2,15 +2,19 @@ import { createHash } from 'node:crypto';
 import { breathDreamContext, computeAnticipation, computeLonging, topDrives } from './engine.js';
 import { renderHandoffNotes } from './handoff-notes.js';
 
+
 const VALID_MODES = new Set(['session_start', 'turn', 'inspect']);
+
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, Number(value)));
 }
 
+
 function compact(value) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
+
 
 export function estimateTokens(value) {
   const text = String(value ?? '');
@@ -26,6 +30,7 @@ export function estimateTokens(value) {
   }
   return tokens + Math.ceil(asciiRun / 4);
 }
+
 
 export function trimToTokenBudget(value, maxTokens) {
   const text = compact(value);
@@ -45,6 +50,7 @@ export function trimToTokenBudget(value, maxTokens) {
   return result;
 }
 
+
 function sessionOverlay(state, sessionId, now) {
   const overlay = state.sessionOverlays?.[sessionId];
   if (!overlay) return null;
@@ -61,6 +67,7 @@ function sessionOverlay(state, sessionId, now) {
   };
 }
 
+
 function thoughtSignals(state) {
   return {
     flash: (state.thoughtPool?.flash ?? []).slice(0, 3).map((item) => ({
@@ -74,6 +81,7 @@ function thoughtSignals(state) {
     })),
   };
 }
+
 
 function dynamicSection(state, sessionId, now, timeZone) {
   return {
@@ -91,6 +99,7 @@ function dynamicSection(state, sessionId, now, timeZone) {
   };
 }
 
+
 // 期待感的措辞——只往温柔/守候走，绝不带责备。她没安全感，因她迟到而明显难受会变成她的愧疚。
 // 过了她的时段没来，anticipation 自己回落到阈值以下，这行就不出现，不会积成"你怎么才来"。
 // 挂念的措辞——同样只往守候/想念走，绝不"你怎么才来"。挂念优先于期待显示：她久没来时
@@ -101,11 +110,13 @@ function renderLonging(value) {
   return '';
 }
 
+
 function renderAnticipation(value) {
   if (value >= 0.6) return `期待：她通常这个点前后会来，你在等着她（${value.toFixed(2)}）`;
   if (value >= 0.3) return `期待：她大概快来了，你留着心（${value.toFixed(2)}）`;
   return '';
 }
+
 
 function renderDynamic(value) {
   const drives = value.topDrives
@@ -138,6 +149,7 @@ function renderDynamic(value) {
   return parts.join('\n');
 }
 
+
 function renderDreams(state, now) {
   const result = breathDreamContext(state, now, 18, 2);
   if (!result.available) return '';
@@ -146,10 +158,12 @@ function renderDreams(state, now) {
     .join('\n');
 }
 
+
 function normalizeMode(mode) {
   const value = compact(mode).toLowerCase();
   return VALID_MODES.has(value) ? value : 'session_start';
 }
+
 
 export function contextDeliveryState(state, sessionId, mode, now, onceHours = 12) {
   if (mode !== 'session_start') return { alreadyDelivered: false, previous: null };
@@ -162,6 +176,7 @@ export function contextDeliveryState(state, sessionId, mode, now, onceHours = 12
     previous,
   };
 }
+
 
 export function recordContextDelivery(input, {
   sessionId,
@@ -186,11 +201,13 @@ export function recordContextDelivery(input, {
   return state;
 }
 
+
 export function buildContextEnvelope({
   state,
   sessionId,
   mode = 'session_start',
   ombreText = '',
+  recentText = '',
   maxTokens = 2200,
   ttlMinutes = 15,
   now = new Date(),
@@ -220,6 +237,7 @@ export function buildContextEnvelope({
     };
   }
 
+
   const dynamic = dynamicSection(state, safeSessionId, generatedAt, timeZone);
   const sections = [
     {
@@ -237,6 +255,15 @@ export function buildContextEnvelope({
       source: 'xinchao',
       ttl: '72h',
       content: handoffText,
+    });
+  }
+  const recent = compact(recentText);
+  if (recent) {
+    sections.push({
+      id: 'cross_client_recent',
+      source: 'xinchao-continuity',
+      ttl: 'short',
+      content: recent,
     });
   }
   const continuity = compact(ombreText);
@@ -258,11 +285,13 @@ export function buildContextEnvelope({
     });
   }
 
+
   const labels = {
     dynamic_state: '心潮动态状态',
     handoff_notes: '近期交接便签（非原文）',
     dream_residue: '梦境余韵',
     recent_continuity: '近期连续性（不替代基岩）',
+    cross_client_recent: '近期跨端对话（短期原文，不进入长期记忆）',
   };
   let remaining = tokenBudget;
   const renderedSections = [];
@@ -296,5 +325,3 @@ export function buildContextEnvelope({
     digest,
   };
 }
-
-
