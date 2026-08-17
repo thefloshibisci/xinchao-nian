@@ -1,35 +1,43 @@
 import { createHash } from 'node:crypto';
 
+
 const MAX_ITEMS = 24;
 const MAX_TEXT_CHARS = 2000;
 const MAX_PROFILES = 16;
 const DEFAULT_TTL_HOURS = 24;
 
+
 function clean(value, max = 120) {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
 }
+
 
 function profileKey(value) {
   return clean(value || 'default', 120) || 'default';
 }
 
+
 function fingerprint(value) {
   return createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex').slice(0, 24);
 }
+
 
 function ttlHours(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.max(1, Math.min(168, parsed)) : DEFAULT_TTL_HOURS;
 }
 
+
 function normalizeRole(value) {
   const role = clean(value || 'user', 24).toLowerCase();
   return ['user', 'assistant', 'system', 'tool'].includes(role) ? role : 'user';
 }
 
+
 export function newContinuityState() {
   return { schemaVersion: 1, profiles: {} };
 }
+
 
 export function recordRecentTurn(input, {
   profileId = 'default', sessionId, turnId, role, text, source = 'unknown',
@@ -66,23 +74,29 @@ export function recordRecentTurn(input, {
   return { state, duplicate: false, eventId };
 }
 
+
 export function recentTurns(input, {
-  profileId = 'default', sessionId = '', limit = 8, includeAllSessions = true, now = new Date(),
+  profileId = 'default', sessionId = '', excludeSessionId = '',
+  limit = 8, includeAllSessions = true, now = new Date(),
 } = {}) {
   const profile = profileKey(profileId);
   const cleanSession = clean(sessionId, 120);
+  const excludedSession = clean(excludeSessionId, 120);
   const rows = (input?.profiles?.[profile] ?? []).filter((item) => (
     Date.parse(item?.expiresAt ?? '') > new Date(now).getTime()
+    && (!excludedSession || item.sessionId !== excludedSession)
     && (includeAllSessions || !cleanSession || item.sessionId === cleanSession)
   ));
   return rows.slice(-Math.max(1, Math.min(24, Number(limit) || 8)));
 }
+
 
 export function renderRecentTurns(input, options = {}) {
   return recentTurns(input, options)
     .map((item) => `${item.createdAt} [${item.source}/${item.sessionId}] ${item.role}: ${item.text}`)
     .join('\n');
 }
+
 
 export const RECENT_CONTINUITY_LIMITS = {
   maxItems: MAX_ITEMS, maxTextChars: MAX_TEXT_CHARS, maxProfiles: MAX_PROFILES,
