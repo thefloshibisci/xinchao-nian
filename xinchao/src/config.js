@@ -38,6 +38,12 @@ export function loadConfig() {
     dreamMinIntervalHours: number('DREAM_MIN_INTERVAL_HOURS', 6, 1, 168),
     dreamMaxPerDay: number('DREAM_MAX_PER_DAY', 4, 1, 12),
     dreamEnabled: bool('DREAM_ENABLED', true),
+    dreamWindow: {
+      enabled: bool('DREAM_WINDOW_ENABLED', false),
+      timeZone: process.env.DREAM_TIME_ZONE ?? process.env.SETTLE_TIME_ZONE ?? 'Asia/Shanghai',
+      startHour: number('DREAM_WINDOW_START_HOUR', 3, 0, 23),
+      endHour: number('DREAM_WINDOW_END_HOUR', 5, 1, 24),
+    },
     ombre: {
       url: process.env.OMBRE_MCP_URL ?? '',
       token: process.env.OMBRE_MCP_TOKEN ?? '',

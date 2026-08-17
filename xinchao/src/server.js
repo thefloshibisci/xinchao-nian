@@ -217,7 +217,7 @@ async function runCycle() {
     const dreamContactIsIdle = contactIdleAllowed(state, now, config.heartbeat.dreamMinIdleHours);
     const proactiveContactIsIdle = contactIdleAllowed(state, now, config.heartbeat.proactiveMinIdleHours);
 
-    if (config.dreamEnabled && dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay)) {
+    if (config.dreamEnabled && dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay, config.dreamWindow)) {
       let material = '';
       if (!config.shadowMode && config.ombre.readEnabled) {
         try { material = await ombre.recentMaterial(topDrives(state)); }
@@ -248,7 +248,7 @@ async function runCycle() {
         details: { dreamCreated: true },
         at: now,
       }, (latest) => {
-        if (!dreamAllowed(latest, now, config.dreamMinIntervalHours, config.dreamMaxPerDay)) return latest;
+        if (!dreamAllowed(latest, now, config.dreamMinIntervalHours, config.dreamMaxPerDay, config.dreamWindow)) return latest;
         return recordDream(latest, dream);
       });
       dreamCreated = true;

@@ -835,8 +835,29 @@ export function proactiveBarkAllowed(state, now, minIntervalHours, maxPerDay, mi
   return strongest >= minDrive && barkAllowed(state, now, minIntervalHours, maxPerDay, 'autonomous_thought');
 }
 
-export function dreamAllowed(state, now, minIntervalHours, maxPerDay) {
+export function dreamAllowed(state, now, minIntervalHours, maxPerDay, window = {}) {
   if (state.consciousness !== 'sleeping') return false;
+
+  // Optional local-time dream window. A two-hour window is deliberately softer
+  // than an exact cron minute: the first settle cycle while sleeping may dream,
+  // and a delayed cycle can still catch up before the window closes.
+  if (window.enabled) {
+    const { day, hour } = localDayAndHour(now, window.timeZone ?? 'Asia/Shanghai');
+    const start = Number(window.startHour ?? 3);
+    const end = Number(window.endHour ?? 5);
+    const inWindow = start < end
+      ? hour >= start && hour < end
+      : hour >= start || hour < end;
+    if (!inWindow) return false;
+    const alreadyDreamedThisLocalDay = (state.recentDreams ?? []).some((dream) => {
+      const createdAt = new Date(dream.createdAt ?? '');
+      return Number.isFinite(createdAt.getTime())
+        && localDayAndHour(createdAt, window.timeZone ?? 'Asia/Shanghai').day === day;
+    });
+    if (alreadyDreamedThisLocalDay) return false;
+    return true;
+  }
+
   const day = iso(now).slice(0, 10);
   if (Number(state.dreamUsage[day] ?? 0) >= maxPerDay) return false;
   const latest = state.recentDreams.at(-1);
