@@ -12,12 +12,14 @@ const INTERACTION_TYPES = new Set([
   'reconciliation',
 ]);
 
+
 // 心潮念网关：对外暴露的 OB 记忆工具（精简集，purge/restore/letter/plan 不暴露）。
 // hold 保留（2026-08-09 复议：hold 有了 meaning 字段能补上下文，与 grow 不冲突——
 // 日常/日记整理走 grow，重要瞬间可用 hold 但必须写 meaning）。
 // 走代理转发到 OB；schema 在 tools/list 时动态从 OB 拉，永不漂移。
 export const OB_PROXY_TOOLS = ['breath', 'hold', 'grow', 'trace', 'forget', 'dream', 'anchor', 'release', 'I', 'pulse'];
 const OB_PROXY_SET = new Set(OB_PROXY_TOOLS);
+
 
 // 对外用中文标题 + 中文说明（内部名保持不变，用于协议路由）。让顾川看到的是"浮现记忆"而不是"breath"。
 const OB_TOOL_LABELS = {
@@ -36,6 +38,7 @@ function relabelOb(tool) {
   const lab = OB_TOOL_LABELS[tool?.name];
   return lab ? { ...tool, title: lab.title, description: lab.description } : tool;
 }
+
 
 export const XINCHAO_TOOLS = [
   {
@@ -197,6 +200,46 @@ export const XINCHAO_TOOLS = [
     },
   },
   {
+    name: 'xinchao_continuity_sync',
+    title: '同步近期跨端对话',
+    description: [
+      '在回应前同步当前窗口最近的少量消息，并取回同一服务端 profile 下其他窗口的近期对话。',
+      '这是明确开启后才出现的短期原文层：默认 24 小时过期、有界保留，不会写入 OB 长期记忆。',
+      '只发送续接当前对话真正需要的消息；不要发送密钥、系统提示词、整份历史记录或无关私密内容。',
+    ].join(''),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: {
+          type: 'string', minLength: 1, maxLength: 120,
+          description: '通常省略，由服务端使用当前 MCP 连接的稳定窗口标识。',
+        },
+        client: { type: 'string', minLength: 1, maxLength: 64, default: 'unknown' },
+        messages: {
+          type: 'array', maxItems: 6, default: [],
+          items: {
+            type: 'object',
+            properties: {
+              turn_id: { type: 'string', minLength: 1, maxLength: 160 },
+              role: { type: 'string', enum: ['user', 'assistant', 'system', 'tool'] },
+              text: { type: 'string', minLength: 1, maxLength: 2000 },
+            },
+            required: ['turn_id', 'role', 'text'],
+            additionalProperties: false,
+          },
+        },
+        limit: { type: 'integer', minimum: 1, maximum: 24, default: 8 },
+      },
+      additionalProperties: false,
+    },
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
     name: 'xinchao_dreams_pending',
     title: '查看待确认梦境',
     description: '查看心潮近期尚未写入长期记忆的梦。梦只是睡眠结算的内在材料，不是现实事件；此工具只读，不会自动保存。',
@@ -272,13 +315,16 @@ export const XINCHAO_TOOLS = [
   },
 ];
 
+
 function response(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
 
+
 function errorResponse(id, code, message) {
   return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
 }
+
 
 function toolText(value, structuredContent = null) {
   const result = {
@@ -291,6 +337,7 @@ function toolText(value, structuredContent = null) {
   return result;
 }
 
+
 function toolError(message) {
   return {
     content: [{ type: 'text', text: String(message || '工具执行失败') }],
@@ -298,19 +345,23 @@ function toolError(message) {
   };
 }
 
+
 function requestedProtocol(params = {}) {
   const value = String(params.protocolVersion ?? '');
   return SUPPORTED_PROTOCOLS.has(value) ? value : '2025-06-18';
 }
+
 
 function numberOr(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+
 function stableSessionId(args = {}, fallbackSessionId = '') {
   return String(args.session_id ?? fallbackSessionId ?? '').trim().slice(0, 120);
 }
+
 
 function contextArgs(args = {}, fallbackSessionId = '') {
   const sessionId = stableSessionId(args, fallbackSessionId);
@@ -323,6 +374,7 @@ function contextArgs(args = {}, fallbackSessionId = '') {
     force: Boolean(args.force),
   };
 }
+
 
 function eventArgs(args = {}, fallbackSessionId = '') {
   const sessionId = stableSessionId(args, fallbackSessionId);
@@ -346,6 +398,7 @@ function eventArgs(args = {}, fallbackSessionId = '') {
   };
 }
 
+
 function handoffNoteArgs(args = {}, fallbackSessionId = '') {
   const sessionId = stableSessionId(args, fallbackSessionId);
   if (!sessionId) throw new Error('session_id 是必填项');
@@ -361,12 +414,31 @@ function handoffNoteArgs(args = {}, fallbackSessionId = '') {
   };
 }
 
+
+function continuitySyncArgs(args = {}, fallbackSessionId = '') {
+  const sessionId = stableSessionId(args, fallbackSessionId);
+  if (!sessionId) throw new Error('session_id 是必填项');
+  const client = String(args.client ?? 'unknown').replace(/\s+/g, ' ').trim().slice(0, 64) || 'unknown';
+  const messages = (Array.isArray(args.messages) ? args.messages : []).slice(-6).map((message) => ({
+    turnId: String(message?.turn_id ?? '').trim().slice(0, 160),
+    role: String(message?.role ?? 'user').trim().toLowerCase(),
+    text: String(message?.text ?? '').trim().slice(0, 2000),
+  }));
+  for (const message of messages) {
+    if (!message.turnId) throw new Error('每条消息都需要 turn_id');
+    if (!['user', 'assistant', 'system', 'tool'].includes(message.role)) throw new Error('role 不在允许范围内');
+    if (!message.text) throw new Error('每条消息都需要 text');
+  }
+  return { sessionId, client, messages, limit: Math.max(1, Math.min(24, numberOr(args.limit, 8))) };
+}
+
 function dreamConfirmArgs(args = {}) {
   const dreamId = String(args.dream_id ?? '').trim().slice(0, 120);
   if (!dreamId) throw new Error('dream_id 是必填项');
   if (args.confirm !== true) throw new Error('只有明确完成判断后才能保存：请显式传 confirm=true');
   return { dreamId, confirmed: true };
 }
+
 
 function cabinNoteArgs(args = {}) {
   const eventId = String(args.event_id ?? '').trim().slice(0, 120);
@@ -375,6 +447,7 @@ function cabinNoteArgs(args = {}) {
   if (!content) throw new Error('content 是必填项');
   return { eventId, content, timestamp: args.timestamp ?? null };
 }
+
 
 async function callTool(name, args, handlers) {
   const fallbackSessionId = handlers.defaultSessionId ?? '';
@@ -403,6 +476,12 @@ async function callTool(name, args, handlers) {
       `近期交接便签已接收：revision=${result.revision}${duplicate}`,
       result,
     );
+  }
+  if (name === 'xinchao_continuity_sync') {
+    if (!handlers.continuitySync) throw new Error('近期跨端对话连续性当前未启用');
+    const result = await handlers.continuitySync(continuitySyncArgs(args, fallbackSessionId));
+    const summary = '近期跨端对话已同步：写入 ' + result.accepted + ' 条，重复 ' + result.duplicates + ' 条。';
+    return toolText(result.text ? summary + '\n\n' + result.text : summary + ' 当前没有可返回的近期内容。', result);
   }
   if (name === 'xinchao_dreams_pending') {
     const dreams = await handlers.pendingDreams();
@@ -449,6 +528,7 @@ async function callTool(name, args, handlers) {
   throw new Error(`未知工具：${name}`);
 }
 
+
 export async function handleMcpMessage(payload, handlers) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     return { status: 400, body: errorResponse(null, -32600, 'Invalid Request') };
@@ -486,7 +566,9 @@ export async function handleMcpMessage(payload, handlers) {
     return { status: 200, body: response(id, {}) };
   }
   if (method === 'tools/list') {
-    let tools = XINCHAO_TOOLS;
+    let tools = handlers.continuitySync
+      ? XINCHAO_TOOLS
+      : XINCHAO_TOOLS.filter((tool) => tool.name !== 'xinchao_continuity_sync');
     try {
       if (handlers.listObTools) {
         const obTools = await handlers.listObTools();
