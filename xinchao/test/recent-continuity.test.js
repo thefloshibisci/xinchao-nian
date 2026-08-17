@@ -7,7 +7,9 @@ import {
   RECENT_CONTINUITY_LIMITS,
 } from '../src/recent-continuity.js';
 
+
 const now = new Date('2026-08-18T12:00:00.000Z');
+
 
 function add(state, overrides = {}) {
   return recordRecentTurn(state, {
@@ -22,6 +24,7 @@ function add(state, overrides = {}) {
   });
 }
 
+
 test('shares recent turns across sessions in one profile', () => {
   const first = add(newContinuityState()).state;
   const second = add(first, {
@@ -32,10 +35,12 @@ test('shares recent turns across sessions in one profile', () => {
     .map((item) => item.text), ['刚刚聊到跨端连续性', '我接上了。']);
 });
 
+
 test('keeps profiles isolated', () => {
   const state = add(newContinuityState()).state;
   assert.equal(recentTurns(state, { profileId: 'someone-else' }).length, 0);
 });
+
 
 test('deduplicates retries by profile, session, turn and role', () => {
   const first = add(newContinuityState());
@@ -43,6 +48,7 @@ test('deduplicates retries by profile, session, turn and role', () => {
   assert.equal(retry.duplicate, true);
   assert.equal(recentTurns(retry.state, { profileId: 'shared' }).length, 1);
 });
+
 
 test('expires items and bounds retained count', () => {
   let state = newContinuityState();
@@ -62,6 +68,7 @@ test('expires items and bounds retained count', () => {
   assert.equal(recentTurns(state, { profileId: 'shared', now: new Date(now.getTime() + 3_700_000) }).length, 0);
 });
 
+
 test('can restrict reads to one session', () => {
   const first = add(newContinuityState()).state;
   const second = add(first, {
@@ -71,4 +78,15 @@ test('can restrict reads to one session', () => {
   assert.deepEqual(recentTurns(second, {
     profileId: 'shared', sessionId: 'codex', includeAllSessions: false,
   }).map((item) => item.text), ['desktop only']);
+});
+
+test('can exclude the current session while returning other clients', () => {
+  const first = add(newContinuityState()).state;
+  const second = add(first, {
+    sessionId: 'codex', turnId: 'turn-2', text: 'desktop only',
+    now: new Date(now.getTime() + 1000),
+  }).state;
+  assert.deepEqual(recentTurns(second, {
+    profileId: 'shared', excludeSessionId: 'codex',
+  }).map((item) => item.text), ['刚刚聊到跨端连续性']);
 });
