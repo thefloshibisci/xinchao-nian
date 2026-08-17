@@ -21,6 +21,8 @@ import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue } from './b
 import { CabinStore } from './cabin-store.js';
 
 
+
+
 const config = validateConfig(loadConfig());
 if (!config.serviceToken) throw new Error('SERVICE_TOKEN is required');
 // 拒绝占位值和弱 token —— 忘了换示例值就启动，等于把钥匙印在说明书上。
@@ -30,6 +32,8 @@ if (/^replace-with/i.test(config.serviceToken)) {
 if (config.serviceToken.length < 32) {
   throw new Error('SERVICE_TOKEN must be at least 32 characters — generate one: openssl rand -hex 32');
 }
+
+
 
 
 const store = new StateStore(config.statePath, () => newState());
@@ -52,9 +56,13 @@ let cyclePromise = null;
 const SYSTEM_VERSION = '2.5.12';
 
 
+
+
 function log(event, fields = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...fields }));
 }
+
+
 
 
 async function updateState(meta, mutate) {
@@ -82,6 +90,8 @@ async function updateState(meta, mutate) {
 }
 
 
+
+
 async function applyResonanceFromMaterial(state, material, kind, now = new Date()) {
   if (!config.resonance.enabled || !material) return state;
   const metadata = await ombre.surfacedMetadata(material);
@@ -106,6 +116,8 @@ async function applyResonanceFromMaterial(state, material, kind, now = new Date(
 }
 
 
+
+
 async function pendingDreams() {
   const state = await store.read();
   return (state.recentDreams ?? [])
@@ -123,7 +135,11 @@ async function pendingDreams() {
 }
 
 
+
+
 const dreamConfirmationPromises = new Map();
+
+
 
 
 async function confirmDreamMemory({ dreamId }) {
@@ -163,6 +179,8 @@ async function confirmDreamMemory({ dreamId }) {
 }
 
 
+
+
 async function synchronizeOmbreHeartbeat() {
   let recordedAt;
   try {
@@ -172,6 +190,8 @@ async function synchronizeOmbreHeartbeat() {
     return null;
   }
   if (!recordedAt) return null;
+
+
 
 
   let observed = false;
@@ -190,6 +210,8 @@ async function synchronizeOmbreHeartbeat() {
 }
 
 
+
+
 async function runCycle() {
   if (cyclePromise) return cyclePromise;
   cyclePromise = (async () => {
@@ -206,10 +228,14 @@ async function runCycle() {
     });
 
 
+
+
     let state = settled.state;
     let dreamCreated = false;
     let barkSent = false;
     let daytimeSent = false;
+
+
 
 
     // 挂念：她过了常来的点还没来 → 轻推 monitor(惦记) 进数值（不只在上下文）。
@@ -233,12 +259,16 @@ async function runCycle() {
     const proactiveContactIsIdle = contactIdleAllowed(state, now, config.heartbeat.proactiveMinIdleHours);
 
 
+
+
     if (config.dreamEnabled && dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay, config.dreamWindow)) {
       let material = '';
       if (!config.shadowMode && config.ombre.readEnabled) {
         try { material = await ombre.recentMaterial(topDrives(state)); }
         catch (error) { log('ombre_read_failed', { message: error.message }); }
       }
+
+
 
 
       let generated;
@@ -254,11 +284,15 @@ async function runCycle() {
       }
 
 
+
+
       const dream = { id: randomUUID(), createdAt: now.toISOString(), ...generated, ombreBucketId: null };
       if (!config.shadowMode && config.ombre.writeEnabled) {
         try { dream.ombreBucketId = await ombre.storeDream(dream); }
         catch (error) { log('ombre_write_failed', { message: error.message }); }
       }
+
+
 
 
       state = await updateState({
@@ -272,6 +306,8 @@ async function runCycle() {
       });
       dreamCreated = true;
       log('dream_settled', { source: dream.source, shadow: config.shadowMode, usedBreath: Boolean(material), revision: state.revision });
+
+
 
 
       if (!config.shadowMode && config.bark.enabled && dreamContactIsIdle && barkAllowed(state, now, config.bark.minIntervalHours, config.bark.maxPerDay, 'dream')) {
@@ -323,6 +359,8 @@ async function runCycle() {
         } catch (error) { log('bark_failed', { kind: 'dream', message: error.message }); }
       }
     }
+
+
 
 
     if (!config.shadowMode && config.bark.enabled && proactiveContactIsIdle && !dreamCreated && proactiveBarkAllowed(state, now, config.bark.autonomousMinIntervalHours, config.bark.maxPerDay, config.bark.minDrive)) {
@@ -389,6 +427,8 @@ async function runCycle() {
         } catch (error) { log('bark_failed', { kind: 'autonomous_thought', message: error.message }); }
       }
     }
+
+
 
 
     if (!state.nextDaytimeEmergenceAt && config.daytime.enabled) {
@@ -463,11 +503,15 @@ async function runCycle() {
 }
 
 
+
+
 function safeEqual(supplied, expected) {
   const left = Buffer.from(supplied);
   const right = Buffer.from(expected);
   return left.length === right.length && timingSafeEqual(left, right);
 }
+
+
 
 
 function auditEventFingerprint(value) {
@@ -478,10 +522,14 @@ function auditEventFingerprint(value) {
 }
 
 
+
+
 function authorized(request) {
   const supplied = request.headers.authorization?.replace(/^Bearer\s+/i, '') ?? '';
   return safeEqual(supplied, config.serviceToken);
 }
+
+
 
 
 function bridgeAuthorized(request) {
@@ -490,10 +538,14 @@ function bridgeAuthorized(request) {
 }
 
 
+
+
 function sendBridgeEvent(response, event, value) {
   response.write(`event: ${event}\n`);
   response.write(`data: ${JSON.stringify(value)}\n\n`);
 }
+
+
 
 
 async function publishReadyBridgeDeliveries() {
@@ -510,9 +562,13 @@ async function publishReadyBridgeDeliveries() {
 }
 
 
+
+
 function mcpPath(url) {
   return url.pathname === '/mcp' || url.pathname.startsWith('/mcp/');
 }
+
+
 
 
 function transportSessionId(request, initialize = false) {
@@ -520,6 +576,8 @@ function transportSessionId(request, initialize = false) {
   if (!initialize && /^[A-Za-z0-9._~-]{1,120}$/.test(supplied)) return supplied;
   return `mcp-${randomUUID()}`;
 }
+
+
 
 
 function negotiatedProtocolVersion(request, payload, result) {
@@ -533,6 +591,8 @@ function negotiatedProtocolVersion(request, payload, result) {
 }
 
 
+
+
 function mcpAuthorized(request, url) {
   if (authorized(request)) return true;
   const bearer = request.headers.authorization?.replace(/^Bearer\s+/i, '') ?? '';
@@ -543,6 +603,8 @@ function mcpAuthorized(request, url) {
 }
 
 
+
+
 async function body(request) {
   let raw = '';
   for await (const chunk of request) {
@@ -551,6 +613,8 @@ async function body(request) {
   }
   return raw ? JSON.parse(raw) : {};
 }
+
+
 
 
 /**
@@ -572,6 +636,8 @@ function applyDashboardCors(request, response, url) {
 }
 
 
+
+
 function send(response, status, value, extraHeaders = {}) {
   response.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
@@ -580,6 +646,8 @@ function send(response, status, value, extraHeaders = {}) {
   });
   response.end(JSON.stringify(value));
 }
+
+
 
 
 function dashboardTimelineOptions(url) {
@@ -593,6 +661,8 @@ function dashboardTimelineOptions(url) {
     types,
   };
 }
+
+
 
 
 async function dashboardPayload(pathname, url) {
@@ -653,6 +723,8 @@ async function dashboardPayload(pathname, url) {
 }
 
 
+
+
 function sendMcp(response, status, value, extraHeaders = {}) {
   const headers = {
     'Cache-Control': 'no-store',
@@ -665,6 +737,8 @@ function sendMcp(response, status, value, extraHeaders = {}) {
   response.writeHead(status, { ...headers, 'Content-Type': 'application/json; charset=utf-8' });
   return response.end(JSON.stringify(value));
 }
+
+
 
 
 async function createContextEnvelope({
@@ -746,6 +820,8 @@ async function createContextEnvelope({
 }
 
 
+
+
 async function synchronizeRecentContinuity({ sessionId, client, messages = [], limit }, now = new Date()) {
   let accepted = 0;
   let duplicates = 0;
@@ -773,11 +849,13 @@ async function synchronizeRecentContinuity({ sessionId, client, messages = [], l
     duplicates,
     text: renderRecentTurns(state, {
       profileId: config.continuity.profileId,
+      excludeSessionId: sessionId,
       limit: limit ?? config.continuity.maxContextTurns,
       now,
     }),
   };
 }
+
 
 async function recordConversationEvent(event, source = 'api', now = new Date()) {
   let applied;
@@ -820,6 +898,8 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
 }
 
 
+
+
 async function saveHandoffNote(note, source = 'mcp', now = new Date()) {
   let applied;
   const state = await updateState({
@@ -844,6 +924,8 @@ async function saveHandoffNote(note, source = 'mcp', now = new Date()) {
 }
 
 
+
+
 function dashboardInteractionFromHttp(payload = {}) {
   const allowedKeys = new Set(['event_id', 'eventId', 'interaction_type', 'interactionType']);
   const unexpected = Object.keys(payload).filter((key) => !allowedKeys.has(key));
@@ -858,6 +940,8 @@ function dashboardInteractionFromHttp(payload = {}) {
     interactionType,
   };
 }
+
+
 
 
 // 只写动作，不写主语和落点 —— 主语用配置里的称呼，落点由实际影响的维度算出来。
@@ -878,6 +962,8 @@ async function enqueueDashboardInteraction(event, result) {
 }
 
 
+
+
 function bridgeDeliveryFromDashboard(payload = {}, now = new Date()) {
   const allowed = new Set(['event_id', 'eventId', 'message', 'deliver_after', 'deliverAfter']);
   const unexpected = Object.keys(payload).filter((key) => !allowed.has(key));
@@ -892,6 +978,8 @@ function bridgeDeliveryFromDashboard(payload = {}, now = new Date()) {
 }
 
 
+
+
 function handoffNoteFromHttp(payload = {}) {
   return {
     sessionId: payload.sessionId ?? payload.session_id,
@@ -902,12 +990,16 @@ function handoffNoteFromHttp(payload = {}) {
 }
 
 
+
+
 async function enqueueCabinNotice({ eventId, message }) {
   if (!config.bridge.enabled) return null;
   const queued = await bridgeQueue.enqueue({ eventId, reason: 'user_note', message });
   await publishReadyBridgeDeliveries();
   return { queued: true, duplicate: queued.duplicate, deliveryId: queued.delivery.id };
 }
+
+
 
 
 function cabinNoteInput(payload = {}, defaultFrom = 'user') {
@@ -921,6 +1013,8 @@ function cabinNoteInput(payload = {}, defaultFrom = 'user') {
 }
 
 
+
+
 function cabinLedgerInput(payload = {}) {
   return {
     eventId: payload.event_id ?? payload.eventId,
@@ -930,6 +1024,8 @@ function cabinLedgerInput(payload = {}) {
     date: payload.date,
   };
 }
+
+
 
 
 const server = createServer(async (request, response) => {
@@ -1202,10 +1298,14 @@ const server = createServer(async (request, response) => {
     if (!authorized(request)) return send(response, 401, { error: 'unauthorized' });
 
 
+
+
     if (request.method === 'GET' && url.pathname.startsWith('/v1/dashboard/')) {
       const payload = await dashboardPayload(url.pathname, url);
       return payload ? send(response, 200, payload) : send(response, 404, { error: 'not found' });
     }
+
+
 
 
     if (request.method === 'GET' && url.pathname === '/v1/state') {
@@ -1271,6 +1371,8 @@ const server = createServer(async (request, response) => {
 });
 
 
+
+
 server.listen(config.port, '0.0.0.0', async () => {
   await store.read();
   await cabin.init();
@@ -1279,12 +1381,18 @@ server.listen(config.port, '0.0.0.0', async () => {
 });
 
 
+
+
 const timer = setInterval(() => runCycle().catch((error) => log('cycle_failed', { message: error.message })), config.settleIntervalMinutes * 60_000);
 timer.unref();
 
 
+
+
 const bridgeTimer = setInterval(() => publishReadyBridgeDeliveries().catch((error) => log('bridge_publish_failed', { message: error.message })), config.bridge.pollSeconds * 1000);
 bridgeTimer.unref();
+
+
 
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
