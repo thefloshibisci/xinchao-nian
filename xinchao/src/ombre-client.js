@@ -120,6 +120,40 @@ export class OmbreClient {
     return extractText(result).slice(0, 10000);
   }
 
+  // 做梦使用独立的、可追踪的召回。固定 query 会让 OB 的稳定排序连续几天
+  // 返回同一批高分桶；这里按近期梦的数量轮换观察角度，并且仅在首轮素材
+  // 全部已被近三次梦使用时，换一个角度再读一次。重试有且只有一次。
+  async dreamMaterial(drives = [], recentDreams = []) {
+    const usedIds = recentDreamSourceIds(recentDreams);
+    const start = Math.max(0, Array.isArray(recentDreams) ? recentDreams.length : 0) % DREAM_MATERIAL_ANGLES.length;
+    const first = await this.recallDreamMaterial(DREAM_MATERIAL_ANGLES[start], drives);
+    let selected = first;
+
+    if (first.bucketIds.length && first.bucketIds.every((id) => usedIds.has(id))) {
+      const fallback = await this.recallDreamMaterial(
+        DREAM_MATERIAL_ANGLES[(start + 1) % DREAM_MATERIAL_ANGLES.length],
+        drives,
+      );
+      if (fallback.bucketIds.some((id) => !usedIds.has(id))) selected = fallback;
+    }
+
+    return {
+      text: selected.text,
+      bucketIds: selected.bucketIds,
+      skippedBucketIds: selected.bucketIds.filter((id) => usedIds.has(id)),
+    };
+  }
+
+  async recallDreamMaterial(angle, drives = []) {
+    const result = await this.callBreath({
+      query: withDriveHint(`${angle}；优先具体的人、话、场景和身体感受，不要返回系统配置、部署或技术信息`, drives),
+      maxResults: this.config.breathMaxResults,
+      maxTokens: this.config.breathMaxTokens,
+    });
+    const text = extractText(result).slice(0, 10000);
+    return { text, bucketIds: parseSurfacedBucketIds(text) };
+  }
+
   async daytimeMaterial(drives = []) {
     const result = await this.callBreath({
       query: withDriveHint('白天自然浮现的近期记忆、具体细节、未说完的话和当下牵挂；不要返回系统配置或技术信息', drives),
@@ -180,6 +214,32 @@ export class OmbreClient {
       return byId;
     })().finally(() => { this.memoryMetadataPromise = null; });
     return this.memoryMetadataPromise;
+  }
+
+  // 星图列表继续只含元数据；用户点开某颗星时才按完整 bucket id 读取一次。
+  // id 必须先存在于 pulse 元数据中，避免把 Dashboard 变成任意 breath 查询代理。
+  async memoryDetail(bucketId) {
+    if (!this.config.readEnabled) return { available: false, reason: 'not_configured' };
+    const id = String(bucketId ?? '').trim();
+    if (!MEMORY_BUCKET_ID_RE.test(id)) return { available: false, reason: 'invalid_id' };
+
+    let byId = await this.memoryMetadata();
+    if (!byId.has(id)) byId = await this.memoryMetadata({ refresh: true });
+    const star = byId.get(id);
+    if (!star) return { available: false, reason: 'not_found' };
+
+    const result = await this.callBreath({
+      query: id,
+      maxResults: 1,
+      maxTokens: Math.max(6000, Math.min(12000, Number(this.config.breathMaxTokens) || 6000)),
+    });
+    const surfaced = extractText(result);
+    if (!parseSurfacedBucketIds(surfaced).includes(id)) {
+      return { available: false, reason: 'not_found' };
+    }
+    const preview = memoryPreview(surfaced, id);
+    if (!preview) return { available: false, reason: 'empty' };
+    return { available: true, id, preview, star };
   }
 
   async surfacedMetadata(text) {
@@ -261,15 +321,47 @@ function withDriveHint(base, drives) {
 
 const DRIVE_HINT_MIN = 0.5;
 const DRIVE_HINT_MAX_LABELS = 3;
+const MEMORY_BUCKET_ID_RE = /^[A-Za-z0-9._-]{1,160}$/;
+const DREAM_MATERIAL_ANGLES = [
+  '最近新增或更新的共同经历、生活细节，以及还没有进入近期梦境的记忆',
+  '最近没说完的话、关系里的细微变化和当下真正牵挂的事',
+  '较久没有浮现、但仍在影响现在的具体记忆和感受',
+];
+
+function recentDreamSourceIds(recentDreams) {
+  const ids = (Array.isArray(recentDreams) ? recentDreams : [])
+    .slice(-3)
+    .flatMap((dream) => Array.isArray(dream?.sourceMemoryIds) ? dream.sourceMemoryIds : []);
+  return new Set(ids.map(String).filter((id) => MEMORY_BUCKET_ID_RE.test(id)));
+}
 
 // 从 breath 输出里把每条桶表头的 [domain:...] 解析出来，供记忆共振算亲和度。
 // OB 2.6.5+（breath-meta）在表头带 domain/tags；老输出没有时返回空数组，不影响。
 export function parseSurfacedBucketIds(text) {
   const ids = [];
-  const re = /\[bucket_id:([A-Za-z0-9_-]{6,120})\]/g;
+  const re = /\[bucket_id:([A-Za-z0-9._-]{1,160})\]/g;
   let match;
   while ((match = re.exec(String(text ?? ''))) !== null) ids.push(match[1]);
   return [...new Set(ids)];
+}
+
+// breath exact-id 输出的首行是读取元数据，正文从下一行开始。星图只需要
+// 一小段预览；已知的尾部检索提示不应混进用户的记忆正文。
+export function memoryPreview(text, bucketId) {
+  const id = String(bucketId ?? '').trim();
+  const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
+  const header = lines.findIndex((line) => line.includes(`[bucket_id:${id}]`));
+  if (header < 0) return '';
+  const body = lines.slice(header + 1);
+  const metadataTail = body.findIndex((line) => (
+    /^\[(?:source_available|relation_hint|related_bucket)/.test(line.trim())
+    || /^👣\s*Footprint/.test(line.trim())
+    || (line.includes('[bucket_id:') && !line.includes(`[bucket_id:${id}]`))
+  ));
+  const contentLines = metadataTail >= 0 ? body.slice(0, metadataTail) : body;
+  while (contentLines.at(-1)?.trim() === '---') contentLines.pop();
+  const content = contentLines.join('\n').trim();
+  return Array.from(content).slice(0, 6000).join('');
 }
 
 export function parseSurfacedDomains(text) {

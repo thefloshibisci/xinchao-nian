@@ -50,3 +50,49 @@ test('current Ombre pulse metadata maps surfaced bucket ids back to domains', as
   assert.deepEqual(second.domains, ['恋爱', '自省']);
   assert.equal(pulseCalls, 1, 'pulse metadata should be cached briefly');
 });
+
+test('dream recall rotates its angle and retries once when all first results were recently used', async () => {
+  const ombre = new OmbreClient({
+    readEnabled: true,
+    writeEnabled: false,
+    breathMaxResults: 3,
+    breathMaxTokens: 800,
+  });
+  const queries = [];
+  ombre.callBreath = async ({ query }) => {
+    queries.push(query);
+    const id = queries.length === 1 ? 'old-memory' : 'new-memory';
+    return { result: { content: [{ type: 'text', text: `[bucket_id:${id}]\n具体记忆 ${id}` }] } };
+  };
+
+  const recalled = await ombre.dreamMaterial([], [{
+    id: 'previous-dream',
+    sourceMemoryIds: ['old-memory'],
+  }]);
+
+  assert.equal(queries.length, 2);
+  assert.match(queries[0], /最近没说完的话/);
+  assert.match(queries[1], /较久没有浮现/);
+  assert.deepEqual(recalled.bucketIds, ['new-memory']);
+  assert.deepEqual(recalled.skippedBucketIds, []);
+  assert.match(recalled.text, /new-memory/);
+});
+
+test('old dreams without source ids remain compatible with rotating dream recall', async () => {
+  const ombre = new OmbreClient({
+    readEnabled: true,
+    writeEnabled: false,
+    breathMaxResults: 3,
+    breathMaxTokens: 800,
+  });
+  let calls = 0;
+  ombre.callBreath = async () => {
+    calls += 1;
+    return { result: { content: [{ type: 'text', text: '[bucket_id:first-source]\n一段新材料' }] } };
+  };
+
+  const recalled = await ombre.dreamMaterial([], [{ id: 'legacy-dream' }]);
+
+  assert.equal(calls, 1);
+  assert.deepEqual(recalled.bucketIds, ['first-source']);
+});

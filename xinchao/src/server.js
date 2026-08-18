@@ -263,8 +263,13 @@ async function runCycle() {
 
     if (config.dreamEnabled && dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay, config.dreamWindow)) {
       let material = '';
+      let sourceMemoryIds = [];
       if (!config.shadowMode && config.ombre.readEnabled) {
-        try { material = await ombre.recentMaterial(topDrives(state)); }
+        try {
+          const recalled = await ombre.dreamMaterial(topDrives(state), state.recentDreams);
+          material = recalled.text;
+          sourceMemoryIds = recalled.bucketIds;
+        }
         catch (error) { log('ombre_read_failed', { message: error.message }); }
       }
 
@@ -276,7 +281,13 @@ async function runCycle() {
         generated = new ModelClient({ ...config.model, enabled: false }).fallback(topDrives(state));
       } else {
         try {
-          generated = await model.generateDream({ state, material, topDrives: topDrives(state) });
+          generated = await model.generateDream({
+            state,
+            material,
+            topDrives: topDrives(state),
+            recentSourceMemoryIds: (state.recentDreams ?? []).slice(-3)
+              .flatMap((item) => Array.isArray(item?.sourceMemoryIds) ? item.sourceMemoryIds : []),
+          });
         } catch (error) {
           log('dream_model_failed', { message: error.message });
           generated = new ModelClient({ ...config.model, enabled: false }).fallback(topDrives(state));
@@ -286,7 +297,13 @@ async function runCycle() {
 
 
 
-      const dream = { id: randomUUID(), createdAt: now.toISOString(), ...generated, ombreBucketId: null };
+      const dream = {
+        id: randomUUID(),
+        createdAt: now.toISOString(),
+        ...generated,
+        sourceMemoryIds,
+        ombreBucketId: null,
+      };
       if (!config.shadowMode && config.ombre.writeEnabled) {
         try { dream.ombreBucketId = await ombre.storeDream(dream); }
         catch (error) { log('ombre_write_failed', { message: error.message }); }
@@ -305,7 +322,13 @@ async function runCycle() {
         return recordDream(latest, dream);
       });
       dreamCreated = true;
-      log('dream_settled', { source: dream.source, shadow: config.shadowMode, usedBreath: Boolean(material), revision: state.revision });
+      log('dream_settled', {
+        source: dream.source,
+        shadow: config.shadowMode,
+        usedBreath: Boolean(material),
+        sourceMemoryCount: sourceMemoryIds.length,
+        revision: state.revision,
+      });
 
 
 
@@ -715,6 +738,16 @@ async function dashboardPayload(pathname, url) {
           timestamps: false,
         },
       };
+    }
+  }
+  if (pathname.endsWith('/memory-bucket')) {
+    if (!config.ombre.readEnabled) return { available: false, reason: 'not_configured' };
+    const id = String(url.searchParams.get('id') ?? '').trim();
+    try {
+      return await ombre.memoryDetail(id);
+    } catch (error) {
+      log('dashboard_memory_bucket_failed', { message: error.message });
+      return { available: false, reason: 'ombre_unavailable' };
     }
   }
   if (pathname.endsWith('/connect')) return buildConnectionManifest(config);

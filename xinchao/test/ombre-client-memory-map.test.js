@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseMemoryMapText } from '../src/ombre-client.js';
+import { OmbreClient, memoryPreview, parseMemoryMapText } from '../src/ombre-client.js';
 
 test('pulse text becomes a metadata-only memory map', () => {
   const result = parseMemoryMapText(`
@@ -50,4 +50,61 @@ test('structured 3.0 map preserves optional emotional stamp fields', () => {
   assert.equal(result.capabilities.driveSnapshots, true);
   assert.equal(result.capabilities.driveAffinity, true);
   assert.equal(result.capabilities.timestamps, true);
+});
+
+test('memory detail only reads an id already present in pulse metadata', async () => {
+  const ombre = new OmbreClient({
+    readEnabled: true,
+    writeEnabled: false,
+    breathMaxResults: 3,
+    breathMaxTokens: 800,
+  });
+  ombre.memoryMap = async () => ({
+    stars: [{ id: 'a35f6a3aeb35', title: '兔子小姐和熊先生', domains: ['恋爱'], tags: ['共同记忆'] }],
+  });
+  ombre.listTools = async () => [{ name: 'breath_search' }];
+  let called = null;
+  ombre.call = async (name, args) => {
+    called = { name, args };
+    return {
+      result: {
+        content: [{
+          type: 'text',
+          text: '[exact_bucket_id:true] [bucket_id:a35f6a3aeb35]\n我们一起看见了月亮。\n第二行。\n👣 Footprint：最近活跃',
+        }],
+      },
+    };
+  };
+
+  const detail = await ombre.memoryDetail('a35f6a3aeb35');
+
+  assert.deepEqual(called, {
+    name: 'breath_search',
+    args: { query: 'a35f6a3aeb35', max_results: 1 },
+  });
+  assert.equal(detail.available, true);
+  assert.equal(detail.preview, '我们一起看见了月亮。\n第二行。');
+  assert.equal(detail.star.title, '兔子小姐和熊先生');
+});
+
+test('memory detail rejects unknown ids without turning Dashboard into a search proxy', async () => {
+  const ombre = new OmbreClient({ readEnabled: true, writeEnabled: false });
+  ombre.memoryMap = async () => ({ stars: [{ id: 'known-memory', title: 'known' }] });
+  let calls = 0;
+  ombre.call = async () => { calls += 1; };
+
+  assert.deepEqual(await ombre.memoryDetail('../secret'), { available: false, reason: 'invalid_id' });
+  assert.deepEqual(await ombre.memoryDetail('missing-memory'), { available: false, reason: 'not_found' });
+  assert.equal(calls, 0);
+});
+
+test('memory preview removes exact-read wrappers and stops before another bucket', () => {
+  assert.equal(memoryPreview(`
+[检索降级]
+[exact_bucket_id:true] [bucket_id:first-memory]
+真正正文
+---
+[bucket_id:another-memory]
+另一条正文
+`, 'first-memory'), '真正正文');
 });
