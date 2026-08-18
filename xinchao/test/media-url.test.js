@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import {
+  createPinnedLookup,
   downloadImageFromUrl,
   isPublicAddress,
   prepareObMediaArgs,
@@ -82,6 +83,23 @@ test('recognizes public and blocked address ranges', () => {
   for (const address of ['127.0.0.1', '10.0.0.1', '169.254.169.254', '192.168.1.1', '::1', 'fc00::1', 'fe80::1', '::127.0.0.1', '::ffff:127.0.0.1']) {
     assert.equal(isPublicAddress(address), false, address);
   }
+});
+
+test('pinned DNS lookup supports both single and all-address Node callbacks', () => {
+  const records = [
+    { address: '8.8.8.8', family: 4 },
+    { address: '2606:4700:4700::1111', family: 6 },
+  ];
+  const lookup = createPinnedLookup(records);
+  lookup('example.test', { all: true }, (error, addresses) => {
+    assert.equal(error, null);
+    assert.deepEqual(addresses, records);
+  });
+  lookup('example.test', {}, (error, address, family) => {
+    assert.equal(error, null);
+    assert.equal(address, '8.8.8.8');
+    assert.equal(family, 4);
+  });
 });
 
 test('rejects private DNS results and non-http protocols before requesting', async () => {

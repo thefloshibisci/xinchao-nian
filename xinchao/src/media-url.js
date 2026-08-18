@@ -117,9 +117,23 @@ async function resolvePublicTarget(url, lookup = dnsLookup) {
   return records;
 }
 
+export function createPinnedLookup(records) {
+  let cursor = 0;
+  return (...lookupArgs) => {
+    const callback = lookupArgs[lookupArgs.length - 1];
+    const requestOptions = lookupArgs[1] ?? {};
+    if (requestOptions.all) {
+      callback(null, records);
+      return;
+    }
+    const record = records[cursor % records.length];
+    cursor += 1;
+    callback(null, record.address, record.family);
+  };
+}
+
 function openPinnedRequest(url, records, { signal } = {}) {
   const transport = url.protocol === 'https:' ? https : http;
-  let cursor = 0;
   return new Promise((resolve, reject) => {
     const request = transport.get(url, {
       agent: false,
@@ -127,17 +141,7 @@ function openPinnedRequest(url, records, { signal } = {}) {
         Accept: 'image/*',
         'User-Agent': 'xinchao-media-fetch/1.0',
       },
-      lookup: (...lookupArgs) => {
-        const callback = lookupArgs[lookupArgs.length - 1];
-        const requestOptions = lookupArgs[1] ?? {};
-        if (requestOptions.all) {
-          callback(null, records);
-          return;
-        }
-        const record = records[cursor % records.length];
-        cursor += 1;
-        callback(null, record.address, record.family);
-      },
+      lookup: createPinnedLookup(records),
       signal,
     }, resolve);
     request.once('error', reject);
