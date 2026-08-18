@@ -102,9 +102,15 @@ function parseMediaUrl(value) {
 async function resolvePublicTarget(url, lookup = dnsLookup) {
   const hostname = hostnameWithoutBrackets(url);
   const literalFamily = isIP(hostname);
-  const records = literalFamily
+  const rawRecords = literalFamily
     ? [{ address: hostname, family: literalFamily }]
     : await lookup(hostname, { all: true, verbatim: true });
+  const records = (Array.isArray(rawRecords) ? rawRecords : [rawRecords])
+    .map((record) => ({
+      address: String(record?.address ?? ''),
+      family: Number(record?.family) || isIP(String(record?.address ?? '')),
+    }))
+    .filter((record) => record.address && record.family);
   if (!records.length || records.some((record) => !isPublicAddress(record.address))) {
     throw new Error('图片链接不能指向本机、内网或保留地址');
   }
@@ -121,7 +127,8 @@ function openPinnedRequest(url, records, { signal } = {}) {
         Accept: 'image/*',
         'User-Agent': 'xinchao-media-fetch/1.0',
       },
-      lookup: (_hostname, _options, callback) => {
+      lookup: (...lookupArgs) => {
+        const callback = lookupArgs[lookupArgs.length - 1];
         const record = records[cursor % records.length];
         cursor += 1;
         callback(null, record.address, record.family);
