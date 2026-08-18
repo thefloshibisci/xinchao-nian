@@ -108,6 +108,109 @@ test('memory detail only reads an id already present in pulse metadata', async (
   assert.equal(detail.star.title, '兔子小姐和熊先生');
 });
 
+test('feel detail uses its dedicated Ombre channel and selects the exact bucket', async () => {
+  const ombre = new OmbreClient({
+    readEnabled: true,
+    writeEnabled: false,
+    breathMaxResults: 3,
+    breathMaxTokens: 800,
+  });
+  ombre.memoryMap = async () => ({
+    stars: [{ id: 'feel_202608181030_V085', title: '一阵心潮', bucketType: 'feel' }],
+  });
+  ombre.listTools = async () => [{ name: 'breath' }, { name: 'breath_advanced' }];
+  let called = null;
+  ombre.call = async (name, args) => {
+    called = { name, args };
+    return {
+      result: {
+        content: [{
+          type: 'text',
+          text: [
+            '=== 你留下的 feel（新→旧）===',
+            '[2026-08-18] [bucket_id:newer_feel]',
+            '另一条感受。',
+            '---',
+            '[2026-08-18] [bucket_id:feel_202608181030_V085]',
+            '晚风吹过来时，我忽然很安心。',
+            '👣 Footprint：刚刚想起',
+          ].join('\n'),
+        }],
+      },
+    };
+  };
+
+  const detail = await ombre.memoryDetail('feel_202608181030_V085');
+
+  assert.deepEqual(called, {
+    name: 'breath_advanced',
+    args: {
+      query: 'feel_202608181030_V085',
+      domain: 'feel',
+      max_results: 1,
+      max_tokens: 6000,
+    },
+  });
+  assert.equal(detail.available, true);
+  assert.equal(detail.preview, '晚风吹过来时，我忽然很安心。');
+  assert.equal(detail.star.bucketType, 'feel');
+});
+
+test('new Ombre feel search retries by title but still verifies the bucket id', async () => {
+  const ombre = new OmbreClient({
+    readEnabled: true,
+    writeEnabled: false,
+    breathMaxResults: 3,
+    breathMaxTokens: 800,
+  });
+  ombre.memoryMap = async () => ({
+    stars: [{ id: 'feel_202608181030_V085', title: '一阵心潮', bucketType: 'feel' }],
+  });
+  ombre.listTools = async () => [{ name: 'breath_advanced' }, { name: 'feel' }];
+  const calls = [];
+  ombre.call = async (name, args) => {
+    calls.push({ name, args });
+    const text = name === 'feel' && args.query === '一阵心潮'
+      ? '[2026-08-18] [bucket_id:feel_202608181030_V085]\n这才是目标感受。'
+      : '没有和这个 ID 相关的 feel。';
+    return { result: { content: [{ type: 'text', text }] } };
+  };
+
+  const detail = await ombre.memoryDetail('feel_202608181030_V085');
+
+  assert.deepEqual(calls, [{
+    name: 'feel',
+    args: { query: 'feel_202608181030_V085', max_tokens: 6000 },
+  }, {
+    name: 'feel',
+    args: { query: '一阵心潮', max_tokens: 6000 },
+  }]);
+  assert.equal(detail.available, true);
+  assert.equal(detail.preview, '这才是目标感受。');
+});
+
+test('transitional Ombre falls back to the legacy feel domain after dedicated search misses', async () => {
+  const ombre = new OmbreClient({ readEnabled: true, writeEnabled: false, breathMaxTokens: 800 });
+  ombre.memoryMap = async () => ({
+    stars: [{ id: 'feel_exact_target', title: '没有字面重合的标题', bucketType: 'feel' }],
+  });
+  ombre.listTools = async () => [{ name: 'feel' }, { name: 'breath_advanced' }];
+  const calls = [];
+  ombre.call = async (name, args) => {
+    calls.push({ name, args });
+    const text = name === 'breath_advanced'
+      ? '[2026-08-18] [bucket_id:feel_exact_target]\n旧通道里的目标正文。'
+      : '[2026-08-18] [bucket_id:a_similar_feel]\n只是相似，不是目标。';
+    return { result: { content: [{ type: 'text', text }] } };
+  };
+
+  const detail = await ombre.memoryDetail('feel_exact_target');
+
+  assert.deepEqual(calls.map(({ name }) => name), ['feel', 'feel', 'breath_advanced']);
+  assert.equal(detail.available, true);
+  assert.equal(detail.preview, '旧通道里的目标正文。');
+});
+
 test('memory detail rejects unknown ids without turning Dashboard into a search proxy', async () => {
   const ombre = new OmbreClient({ readEnabled: true, writeEnabled: false });
   ombre.memoryMap = async () => ({ stars: [{ id: 'known-memory', title: 'known' }] });

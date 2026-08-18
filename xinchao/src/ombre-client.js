@@ -111,6 +111,39 @@ export class OmbreClient {
     return this.call('breath', { query, max_results: maxResults, max_tokens: maxTokens });
   }
 
+  // feel 在 OB 里是专用记忆类型：普通精确 ID breath 会有意排除它。
+  // 2.x 通过 breath_advanced(domain="feel") 返回 feel 通道；3.x 另有 feel(query)。
+  // 新版优先走它自己的 feel 工具；若它把 ID 当语义关键词而没命中，再用 pulse
+  // 已提供的标题检索一次。旧版才走 domain 兼容入口。调用方仍会核对
+  // bucket_id，不让相似 feel 冒充目标。
+  async callFeelDetail(star, maxTokens) {
+    const tools = await this.listTools();
+    const names = new Set(tools.map((tool) => tool?.name));
+    const id = String(star?.id ?? '').trim();
+    const common = { query: id, max_results: 1, max_tokens: maxTokens, domain: 'feel' };
+    let result;
+
+    if (names.has('feel')) {
+      result = await this.call('feel', { query: id, max_tokens: maxTokens });
+      if (parseSurfacedBucketIds(extractText(result)).includes(id)) return result;
+
+      const title = String(star?.title ?? '').trim();
+      if (title && title !== id) {
+        result = await this.call('feel', { query: title, max_tokens: maxTokens });
+        if (parseSurfacedBucketIds(extractText(result)).includes(id)) return result;
+      }
+    } else if (names.has('breath_advanced')) {
+      return this.call('breath_advanced', common);
+    } else {
+      return this.call('breath', common);
+    }
+
+    // 某些过渡版本同时暴露新版 feel 和旧版 domain 路由；专用搜索未命中时，
+    // 再用旧路由读取一次，仍由 memoryDetail 对目标 ID 做最终核验。
+    if (names.has('breath_advanced')) return this.call('breath_advanced', common);
+    return result;
+  }
+
   async recentMaterial(drives = []) {
     const result = await this.callBreath({
       query: withDriveHint('近期重要记忆、情绪、关系变化和未完成事项', drives),
@@ -228,11 +261,10 @@ export class OmbreClient {
     const star = byId.get(id);
     if (!star) return { available: false, reason: 'not_found' };
 
-    const result = await this.callBreath({
-      query: id,
-      maxResults: 1,
-      maxTokens: Math.max(6000, Math.min(12000, Number(this.config.breathMaxTokens) || 6000)),
-    });
+    const maxTokens = Math.max(6000, Math.min(12000, Number(this.config.breathMaxTokens) || 6000));
+    const result = star.bucketType === 'feel'
+      ? await this.callFeelDetail(star, maxTokens)
+      : await this.callBreath({ query: id, maxResults: 1, maxTokens });
     const surfaced = extractText(result);
     if (!parseSurfacedBucketIds(surfaced).includes(id)) {
       return { available: false, reason: 'not_found' };
