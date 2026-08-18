@@ -129,6 +129,11 @@ function openPinnedRequest(url, records, { signal } = {}) {
       },
       lookup: (...lookupArgs) => {
         const callback = lookupArgs[lookupArgs.length - 1];
+        const requestOptions = lookupArgs[1] ?? {};
+        if (requestOptions.all) {
+          callback(null, records);
+          return;
+        }
         const record = records[cursor % records.length];
         cursor += 1;
         callback(null, record.address, record.family);
