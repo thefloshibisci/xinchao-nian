@@ -16,7 +16,9 @@ ENV NODE_ENV=production \
     TRANSITION_JOURNAL_PATH=/app/state/transitions.jsonl \
     OAUTH_STATE_PATH=/app/state/oauth.json \
     BRIDGE_STATE_PATH=/app/state/bridge-queue.json \
-    CABIN_STATE_PATH=/app/state/cabin.json
+    CABIN_STATE_PATH=/app/state/cabin.json \
+    RECENT_CONTINUITY_ENABLED=true \
+    RECENT_CONTINUITY_STATE_PATH=/app/state/recent-continuity.json
 EXPOSE 18110
 VOLUME ["/app/state"]
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD node -e "fetch('http://127.0.0.1:18110/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
