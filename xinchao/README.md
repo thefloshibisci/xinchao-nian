@@ -118,6 +118,26 @@ https://xinchao.example.com/mcp
 
 `session_id` 是可选覆盖值。正常情况下服务端会使用 MCP 连接自带的稳定窗口 ID。
 
+通过心潮代理调用 OB 的 `hold` 或 `trace` 时，媒体也可以直接使用公开图片链接：
+
+```json
+{
+  "media": [
+    {
+      "url": "https://example.com/photo.jpg",
+      "title": "照片",
+      "note": "可选说明"
+    }
+  ]
+}
+```
+
+`hold.media`、`trace.media_append` 和 `trace.media_replace` 均支持这种写法，也支持直接传
+`https://...` 字符串。心潮会先下载图片，再转换为 OB 原生媒体格式；Base64 不会经过聊天上下文。
+为避免请求过大，单次调用的图片总大小上限为 2.5 MiB。目前接受 PNG、JPEG、GIF、WebP 与
+AVIF；本机、内网、云元数据地址、非图片响应及不安全重定向会被拒绝。原有服务器路径和
+`data_base64` 写法保持不变。
+
 ## HTTP API
 
 除 `/health` 与 OAuth 发现/授权端点外，业务 API 都要求：

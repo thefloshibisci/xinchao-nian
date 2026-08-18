@@ -41,3 +41,25 @@ test('exposes and validates continuity sync when enabled', async () => {
     limit: 6,
   });
 });
+
+test('keeps existing server-path media unchanged while proxying hold to OB', async () => {
+  let received;
+  const handlers = {
+    callOb: async (name, args) => {
+      received = { name, args };
+      return { result: { content: [{ type: 'text', text: 'ok' }] } };
+    },
+  };
+
+  // A server-readable path remains untouched here; URL conversion itself is
+  // covered independently without making this protocol test use the network.
+  const called = await handleMcpMessage(message('tools/call', {
+    name: 'hold',
+    arguments: { content: 'memory', media: '/srv/photo.png' },
+  }), handlers);
+  assert.equal(called.body.result.isError, undefined);
+  assert.deepEqual(received, {
+    name: 'hold',
+    args: { content: 'memory', media: '/srv/photo.png' },
+  });
+});
