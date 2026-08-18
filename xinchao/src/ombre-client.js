@@ -412,17 +412,32 @@ function numberOrNull(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function memoryTypeFromIcon(icon) {
+  switch (icon) {
+    case '📌': return { bucketType: 'permanent', pinned: true };
+    case '📦': return { bucketType: 'permanent', pinned: false };
+    case '🫧': return { bucketType: 'feel', pinned: false };
+    case '📋': return { bucketType: 'plan', pinned: false };
+    case '💌': return { bucketType: 'letter', pinned: false };
+    case '🗄️': return { bucketType: 'archive', pinned: false };
+    case '✅': return { bucketType: 'dynamic', pinned: false, resolved: true };
+    default: return { bucketType: 'dynamic', pinned: false };
+  }
+}
+
 function normalizeStar(star = {}) {
   const id = String(star.id ?? star.bucketId ?? star.bucket_id ?? '').trim();
   if (!id) return null;
-  const pinned = Boolean(star.pinned || star.bucketType === 'permanent' || star.type === 'permanent');
+  const pinned = Boolean(star.pinned || star.protected);
+  const bucketType = String(star.bucketType ?? star.type ?? (pinned ? 'permanent' : 'dynamic')).trim()
+    || (pinned ? 'permanent' : 'dynamic');
   const driveSnapshot = star.driveSnapshot ?? star.drive_snapshot ?? null;
   const driveAffinity = star.driveAffinity ?? star.drive_affinity ?? null;
   return {
     id,
     title: String(star.title ?? star.name ?? '（无题）').trim() || '（无题）',
     pinned,
-    bucketType: String(star.bucketType ?? star.type ?? (pinned ? 'permanent' : 'dynamic')),
+    bucketType,
     domains: Array.isArray(star.domains) ? star.domains.map(String).filter(Boolean)
       : Array.isArray(star.domain) ? star.domain.map(String).filter(Boolean)
         : String(star.domain ?? '').split(/[,，]/).map((item) => item.trim()).filter(Boolean),
@@ -543,10 +558,11 @@ export function parseMemoryMapText(raw) {
   if (size) stats.size = size[1];
 
   const stars = [];
-  const line = /((?:\uD83D\uDCCC)?)\s*\[([0-9a-f]+)\]\s*《([^》]*)》([^\n]*)/gi;
+  const line = /^[^\S\r\n]*(📌|📦|🫧|📋|💌|🗄️|✅|💭)?[^\S\r\n]*\[([A-Za-z0-9._-]{1,160})\](?:[^\S\r\n]*《([^》]*)》)?([^\r\n]*)/gmu;
   let match;
   while ((match = line.exec(text)) !== null) {
-    const [, pin, id, title, tail] = match;
+    const [, icon, id, title, tail] = match;
+    const memoryType = memoryTypeFromIcon(icon);
     const domain = (tail.match(/主题[:：]\s*([^\s]+)/) || [])[1] || '';
     const emotion = tail.match(/情感[:：]\s*V(-?[\d.]+)\/A(-?[\d.]+)/);
     const importance = (tail.match(/重要[:：]\s*([\d.]+)/) || [])[1];
@@ -555,8 +571,7 @@ export function parseMemoryMapText(raw) {
     stars.push(normalizeStar({
       id,
       title,
-      pinned: pin.length > 0,
-      bucketType: pin.length > 0 ? 'permanent' : 'dynamic',
+      ...memoryType,
       domains: domain.split(/[,，]/).filter(Boolean),
       valence: emotion ? Number(emotion[1]) : null,
       arousal: emotion ? Number(emotion[2]) : null,

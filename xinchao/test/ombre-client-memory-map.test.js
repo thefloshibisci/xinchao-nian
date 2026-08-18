@@ -5,20 +5,34 @@ import { OmbreClient, memoryPreview, parseMemoryMapText } from '../src/ombre-cli
 
 test('pulse text becomes a metadata-only memory map', () => {
   const result = parseMemoryMapText(`
-固化桶：1
-动态桶：2
-归档桶：3
+固化桶：2
+动态桶：4
+归档桶：1
 总占用：2.5 MB
-📌 [a35f6a3aeb35] 《以前我们只有文字》 主题:恋爱,成长 情感:V0.9/A0.7 重要:10 权重:80 标签:共同记忆,承诺,成长
-[c3b4466ae887] 《你呼吸就可以想起来了》 主题:恋爱 情感:V0.8/A0.4 重要:8 权重:45 标签:共同记忆,承诺,成长
-[d4c5577bf998] 《一段完全不同的生活记忆》 主题:生活 情感:V0.5/A0.2 重要:4 权重:12 标签:吃饭,天气,通勤
-[e5d6688ca009] 《另一段独立的工作记录》 主题:工作 情感:V0.4/A0.5 重要:3 权重:9 标签:项目,会议,进度
+📌 [core123] 《钉住核心》 主题:恋爱,成长 情感:V0.9/A0.7 重要:10 权重:80 标签:共同记忆,承诺,成长
+📦 [long456] 《普通长期》 主题:恋爱 情感:V0.8/A0.4 重要:8 权重:45 标签:共同记忆,承诺,成长
+🫧 [feel_202608181030_V085] 《一阵心潮》 主题:生活 情感:V0.5/A0.8 重要:7 权重:30 标签:感受,晚风
+📋 [plan777] 《明天的计划》 主题:生活 情感:V0.6/A0.3 重要:5 权重:18 标签:计划,安排
+💌 [letter777] 《没有寄出的信》 主题:恋爱 情感:V0.7/A0.6 重要:6 权重:24 标签:信件,心事
+💭 [live789] 《动态记忆》 主题:生活 情感:V0.5/A0.2 重要:4 权重:12 标签:吃饭,天气,通勤
+🗄️ [old999] 《归档记忆》 主题:工作 情感:V0.4/A0.5 重要:3 权重:9 标签:项目,会议,进度
+✅ [done888] 《已经解决》 [已解决] 主题:生活 情感:V0.6/A0.3 重要:2 权重:5 标签:琐事
 `);
 
   assert.equal(result.available, true);
-  assert.equal(result.total, 4);
-  assert.equal(result.stats.pinned, 1);
+  assert.equal(result.total, 8);
+  assert.equal(result.stats.pinned, 2);
   assert.equal(result.stars[0].pinned, true);
+  assert.equal(result.stars[0].bucketType, 'permanent');
+  assert.equal(result.stars[1].pinned, false);
+  assert.equal(result.stars[1].bucketType, 'permanent');
+  assert.equal(result.stars[2].id, 'feel_202608181030_V085');
+  assert.equal(result.stars[2].bucketType, 'feel');
+  assert.equal(result.stars[3].bucketType, 'plan');
+  assert.equal(result.stars[4].bucketType, 'letter');
+  assert.equal(result.stars[5].bucketType, 'dynamic');
+  assert.equal(result.stars[6].bucketType, 'archive');
+  assert.equal(result.stars[7].resolved, true);
   assert.equal(result.stars[0].driveSnapshot, null);
   assert.equal(result.stars[0].historical, true);
   assert.equal(result.edges.length, 1);
@@ -39,6 +53,11 @@ test('structured 3.0 map preserves optional emotional stamp fields', () => {
       drive_snapshot: { possess: .8 },
       drive_affinity: { possess: .9 },
       created_at: '2026-08-09T10:00:00.000Z',
+    }, {
+      id: 'ordinary-permanent',
+      title: '没有钉住的普通长期记忆',
+      type: 'permanent',
+      pinned: false,
     }],
     edges: [],
   }));
@@ -47,6 +66,8 @@ test('structured 3.0 map preserves optional emotional stamp fields', () => {
   assert.equal(result.stars[0].historical, false);
   assert.deepEqual(result.stars[0].driveSnapshot, { possess: .8 });
   assert.deepEqual(result.stars[0].driveAffinity, { possess: .9 });
+  assert.equal(result.stars[1].bucketType, 'permanent');
+  assert.equal(result.stars[1].pinned, false);
   assert.equal(result.capabilities.driveSnapshots, true);
   assert.equal(result.capabilities.driveAffinity, true);
   assert.equal(result.capabilities.timestamps, true);
