@@ -96,3 +96,43 @@ test('old dreams without source ids remain compatible with rotating dream recall
   assert.equal(calls, 1);
   assert.deepEqual(recalled.bucketIds, ['first-source']);
 });
+
+test('dream recall removes reused buckets even when OB mixes old and new candidates', async () => {
+  const ombre = new OmbreClient({
+    readEnabled: true,
+    writeEnabled: false,
+    breathMaxResults: 3,
+    breathMaxTokens: 800,
+  });
+  ombre.callBreath = async () => ({ result: { content: [{ type: 'text', text: [
+    '[bucket_id:old-memory]\n旧素材',
+    '---',
+    '[bucket_id:new-memory]\n新素材',
+  ].join('\n') }] } });
+
+  const recalled = await ombre.dreamMaterial([], [{ sourceMemoryIds: ['old-memory'] }]);
+
+  assert.deepEqual(recalled.bucketIds, ['new-memory']);
+  assert.doesNotMatch(recalled.text, /old-memory/);
+  assert.match(recalled.text, /新素材/);
+});
+
+test('dream recall returns no repeated material after every angle only finds used buckets', async () => {
+  const ombre = new OmbreClient({
+    readEnabled: true,
+    writeEnabled: false,
+    breathMaxResults: 3,
+    breathMaxTokens: 800,
+  });
+  let calls = 0;
+  ombre.callBreath = async () => {
+    calls += 1;
+    return { result: { content: [{ type: 'text', text: '[bucket_id:old-memory]\n重复素材' }] } };
+  };
+
+  const recalled = await ombre.dreamMaterial([], [{ sourceMemoryIds: ['old-memory'] }]);
+
+  assert.equal(calls, 3);
+  assert.deepEqual(recalled.bucketIds, []);
+  assert.equal(recalled.text, '');
+});

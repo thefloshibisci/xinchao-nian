@@ -31,7 +31,7 @@ test('shares recent turns across sessions in one profile', () => {
     sessionId: 'codex', turnId: 'turn-2', role: 'assistant', text: '我接上了。', source: 'codex',
     now: new Date(now.getTime() + 1000),
   }).state;
-  assert.deepEqual(recentTurns(second, { profileId: 'shared', sessionId: 'new-window' })
+  assert.deepEqual(recentTurns(second, { profileId: 'shared', sessionId: 'new-window', now })
     .map((item) => item.text), ['刚刚聊到跨端连续性', '我接上了。']);
 });
 
@@ -46,7 +46,7 @@ test('deduplicates retries by profile, session, turn and role', () => {
   const first = add(newContinuityState());
   const retry = add(first.state);
   assert.equal(retry.duplicate, true);
-  assert.equal(recentTurns(retry.state, { profileId: 'shared' }).length, 1);
+  assert.equal(recentTurns(retry.state, { profileId: 'shared', now }).length, 1);
 });
 
 
@@ -76,7 +76,7 @@ test('can restrict reads to one session', () => {
     now: new Date(now.getTime() + 1000),
   }).state;
   assert.deepEqual(recentTurns(second, {
-    profileId: 'shared', sessionId: 'codex', includeAllSessions: false,
+    profileId: 'shared', sessionId: 'codex', includeAllSessions: false, now,
   }).map((item) => item.text), ['desktop only']);
 });
 
@@ -87,6 +87,6 @@ test('can exclude the current session while returning other clients', () => {
     now: new Date(now.getTime() + 1000),
   }).state;
   assert.deepEqual(recentTurns(second, {
-    profileId: 'shared', excludeSessionId: 'codex',
+    profileId: 'shared', excludeSessionId: 'codex', now,
   }).map((item) => item.text), ['刚刚聊到跨端连续性']);
 });

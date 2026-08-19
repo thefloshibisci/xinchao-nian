@@ -1,3 +1,5 @@
+import { planRecall, withRecallPolicyHint } from './recall-policy.js';
+
 export class OmbreClient {
   constructor(config) {
     this.config = config;
@@ -145,29 +147,33 @@ export class OmbreClient {
   }
 
   async recentMaterial(drives = []) {
+    const policy = planRecall({ purpose: 'continuity', maxResults: this.config.breathMaxResults, maxTokens: this.config.breathMaxTokens });
     const result = await this.callBreath({
-      query: withDriveHint('近期重要记忆、情绪、关系变化和未完成事项', drives),
-      maxResults: this.config.breathMaxResults,
-      maxTokens: this.config.breathMaxTokens
+      query: withDriveHint(withRecallPolicyHint('近期重要记忆、情绪、关系变化和未完成事项', policy), drives),
+      maxResults: policy.maxResults,
+      maxTokens: policy.maxTokens
     });
     return extractText(result).slice(0, 10000);
   }
 
   // 做梦使用独立的、可追踪的召回。固定 query 会让 OB 的稳定排序连续几天
-  // 返回同一批高分桶；这里按近期梦的数量轮换观察角度，并且仅在首轮素材
-  // 全部已被近三次梦使用时，换一个角度再读一次。重试有且只有一次。
+  // 返回同一批高分桶；这里按近期梦的数量轮换观察角度，并排除近三次梦
+  // 已经用过的记忆桶。必要时会把三个角度各试一次，宁可这晚没有新素材，
+  // 也不再用相同的旧桶拼一个近似的梦。
   async dreamMaterial(drives = [], recentDreams = []) {
     const usedIds = recentDreamSourceIds(recentDreams);
     const start = Math.max(0, Array.isArray(recentDreams) ? recentDreams.length : 0) % DREAM_MATERIAL_ANGLES.length;
-    const first = await this.recallDreamMaterial(DREAM_MATERIAL_ANGLES[start], drives);
-    let selected = first;
-
-    if (first.bucketIds.length && first.bucketIds.every((id) => usedIds.has(id))) {
-      const fallback = await this.recallDreamMaterial(
-        DREAM_MATERIAL_ANGLES[(start + 1) % DREAM_MATERIAL_ANGLES.length],
-        drives,
-      );
-      if (fallback.bucketIds.some((id) => !usedIds.has(id))) selected = fallback;
+    let selected = { text: '', bucketIds: [] };
+    for (let offset = 0; offset < DREAM_MATERIAL_ANGLES.length; offset += 1) {
+      const angle = DREAM_MATERIAL_ANGLES[(start + offset) % DREAM_MATERIAL_ANGLES.length];
+      const candidate = await this.recallDreamMaterial(angle, drives, usedIds);
+      if (candidate.bucketIds.length && candidate.bucketIds.some((id) => !usedIds.has(id))) {
+        selected = candidate;
+        break;
+      }
+      // If OB returned no bucket ids, retain the first text as a last-resort
+      // material. A later angle may still produce a genuinely new bucket.
+      if (!selected.text && candidate.text && !candidate.bucketIds.length) selected = candidate;
     }
 
     return {
@@ -177,44 +183,55 @@ export class OmbreClient {
     };
   }
 
-  async recallDreamMaterial(angle, drives = []) {
+  async recallDreamMaterial(angle, drives = [], excludedIds = new Set()) {
+    const policy = planRecall({ purpose: 'dream', maxResults: this.config.breathMaxResults, maxTokens: this.config.breathMaxTokens });
+    const excluded = [...(excludedIds instanceof Set ? excludedIds : new Set(excludedIds ?? []))]
+      .filter((id) => MEMORY_BUCKET_ID_RE.test(String(id)))
+      .slice(0, 12);
+    const exclusionHint = excluded.length
+      ? `；最近梦境已经用过这些记忆桶（${excluded.join('、')}），请不要返回它们，改找别的具体记忆`
+      : '';
     const result = await this.callBreath({
-      query: withDriveHint(`${angle}；优先具体的人、话、场景和身体感受，不要返回系统配置、部署或技术信息`, drives),
-      maxResults: this.config.breathMaxResults,
-      maxTokens: this.config.breathMaxTokens,
+      query: withDriveHint(withRecallPolicyHint(`${angle}${exclusionHint}；优先具体的人、话、场景和身体感受，不要返回系统配置、部署或技术信息`, policy), drives),
+      maxResults: policy.maxResults,
+      maxTokens: policy.maxTokens,
     });
-    const text = extractText(result).slice(0, 10000);
+    const rawText = extractText(result).slice(0, 10000);
+    const text = removeExcludedDreamBuckets(rawText, excludedIds);
     return { text, bucketIds: parseSurfacedBucketIds(text) };
   }
 
   async daytimeMaterial(drives = []) {
+    const policy = planRecall({ purpose: 'ambient', maxResults: this.config.breathMaxResults, maxTokens: this.config.breathMaxTokens });
     const result = await this.callBreath({
-      query: withDriveHint('白天自然浮现的近期记忆、具体细节、未说完的话和当下牵挂；不要返回系统配置或技术信息', drives),
-      maxResults: this.config.breathMaxResults,
-      maxTokens: this.config.breathMaxTokens
+      query: withDriveHint(withRecallPolicyHint('白天自然浮现的近期记忆、具体细节、未说完的话和当下牵挂；不要返回系统配置或技术信息', policy), drives),
+      maxResults: policy.maxResults,
+      maxTokens: policy.maxTokens
     });
     return extractText(result).slice(0, 10000);
   }
 
   // 自主念头用的材料：比日间浮现更短，只要能让念头落到具体的事上。
   async thoughtMaterial(drives = []) {
+    const policy = planRecall({ purpose: 'ambient', maxResults: this.config.breathMaxResults, maxTokens: this.config.breathMaxTokens });
     const result = await this.callBreath({
-      query: withDriveHint('此刻自然想起的一件具体的事：最近的共同经历、说过的话或还惦记着的东西；不要返回系统配置、部署或技术信息', drives),
-      maxResults: Math.max(1, Math.min(3, Number(this.config.breathMaxResults) || 2)),
-      maxTokens: Math.max(200, Math.min(600, Number(this.config.breathMaxTokens) || 400))
+      query: withDriveHint(withRecallPolicyHint('此刻自然想起的一件具体的事：最近的共同经历、说过的话或还惦记着的东西；不要返回系统配置、部署或技术信息', policy), drives),
+      maxResults: policy.maxResults,
+      maxTokens: Math.min(policy.maxTokens, 600)
     });
     return extractText(result).slice(0, 4000);
   }
 
   async recentContinuityMaterial(maxTokens = this.config.breathMaxTokens) {
+    const policy = planRecall({ purpose: 'continuity', maxResults: Math.max(3, Math.min(8, Number(this.config.breathMaxResults) || 3)), maxTokens });
     const result = await this.callBreath({
       query: [
         '新窗口近期连续性：只返回最近发生了什么，以及仍直接影响现在的人物与关系变化、生活重点和未完成约定。',
         '不要返回核心准则、自我基岩或长期画像；这些由客户端从自己的核心指令和长期记忆单独完整读取。',
         '不要返回部署、代码、接口、密钥、系统日志或已经过期的技术待办。',
-      ].join(''),
-      maxResults: Math.max(3, Math.min(8, Number(this.config.breathMaxResults) || 3)),
-      maxTokens: Math.max(200, Math.min(3000, Number(maxTokens) || 1600)),
+      ].join('') + ` ${policy.suffix}`,
+      maxResults: policy.maxResults,
+      maxTokens: policy.maxTokens,
     });
     return extractText(result).slice(0, 16000);
   }
@@ -365,6 +382,30 @@ function recentDreamSourceIds(recentDreams) {
     .slice(-3)
     .flatMap((dream) => Array.isArray(dream?.sourceMemoryIds) ? dream.sourceMemoryIds : []);
   return new Set(ids.map(String).filter((id) => MEMORY_BUCKET_ID_RE.test(id)));
+}
+
+function removeExcludedDreamBuckets(text, excludedIds) {
+  const excluded = excludedIds instanceof Set
+    ? excludedIds
+    : new Set(Array.isArray(excludedIds) ? excludedIds.map(String) : []);
+  if (!excluded.size) return String(text ?? '');
+  const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
+  const starts = [];
+  lines.forEach((line, index) => {
+    const match = line.match(/\[bucket_id:([A-Za-z0-9._-]{1,160})\]/);
+    if (match) starts.push({ index, id: match[1] });
+  });
+  if (!starts.length) return String(text ?? '');
+  const kept = [];
+  let cursor = 0;
+  for (let index = 0; index < starts.length; index += 1) {
+    const start = starts[index];
+    const end = starts[index + 1]?.index ?? lines.length;
+    if (!excluded.has(start.id)) kept.push(...lines.slice(cursor, end));
+    cursor = end;
+  }
+  if (cursor < lines.length) kept.push(...lines.slice(cursor));
+  return kept.join('\n').trim();
 }
 
 // 从 breath 输出里把每条桶表头的 [domain:...] 解析出来，供记忆共振算亲和度。
