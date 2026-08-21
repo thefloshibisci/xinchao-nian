@@ -25,6 +25,13 @@ P0luz/Ombre-Brain（原项目, MIT, © P0lar1zzZ）
    - 压缩模型从 GLM-Z1 换成 DeepSeek-V3（11.5s → ~1.0s）。通过 config / 环境变量配置，
      不改源码。
 
+3. **grow 超时重试防重复**
+   - `src/tools/grow/retry_guard.py`：同一份 grow 请求在短时间内只运行一次；客户端超时或
+     断开不会取消已经开始的写入，进行中重试会收到状态提示，完成后重试会复用原结果。
+   - 指纹额外纳入二改版的 `auto/source` 写入门卫参数，人工写入与后台候选不会被误判为
+     同一请求；真实失败不缓存，仍可正常重试。短内容自动候选的门卫判断也位于防重边界内，
+     暂缓/拒绝结果只短暂冷却，避免网络重试虚增候选出现次数，同时不长期锁住真实复现。
+
 > OB 原生功能全部保留：breath / hold / grow / dream / trace / anchor / release / forget /
 > restore / purge / I / plan / letter / pulse 与 Dashboard。心潮念只做上述增量，不裁剪。
 

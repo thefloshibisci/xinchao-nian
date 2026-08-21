@@ -25,6 +25,11 @@ from .. import _runtime as rt
 from .._common import check_grow_input_size, check_grow_items_payload
 from .shortpath import grow_shortpath
 from .core import grow_core, grow_items
+from .retry_guard import (
+    PENDING_RETRY_WINDOW_SECONDS,
+    request_fingerprint,
+    run_once,
+)
 from ..write_admission import decide_write, default_ledger_path
 
 
@@ -44,7 +49,16 @@ async def dispatch(
         err = check_grow_items_payload(items)
         if err:
             return err
-        return await grow_items(items, auto=auto, source=source)
+        fingerprint = request_fingerprint(
+            content=content,
+            items=items,
+            auto=auto,
+            source=source,
+        )
+        return await run_once(
+            fingerprint,
+            lambda: grow_items(items, auto=auto, source=source),
+        )
 
     if not content or not content.strip():
         return "内容为空，无法整理。"
@@ -54,15 +68,43 @@ async def dispatch(
         return err
 
     if len(content.strip()) < 30:
-        admission = decide_write(
-            content,
+        fingerprint = request_fingerprint(
+            content=content,
+            items=None,
             auto=auto,
             source=source,
-            ledger_path=default_ledger_path(rt.config) if auto else None,
         )
-        if not admission.allowed:
-            if admission.reason == "technical_only":
-                return "自动写入已拒绝：纯技术内容不进入 Ombre Brain。"
-            return "自动候选暂未写入；人工 grow/hold 可直接保存。"
-        return await grow_shortpath(content)
-    return await grow_core(content, auto=auto, source=source)
+
+        async def admitted_shortpath() -> str:
+            admission = decide_write(
+                content,
+                auto=auto,
+                source=source,
+                ledger_path=default_ledger_path(rt.config) if auto else None,
+            )
+            if not admission.allowed:
+                if admission.reason == "technical_only":
+                    return "自动写入已拒绝：纯技术内容不进入 Ombre Brain。"
+                return "自动候选暂未写入；人工 grow/hold 可直接保存。"
+            return await grow_shortpath(content)
+
+        def shortpath_result_ttl(result: str) -> float:
+            if result.startswith(("自动写入已拒绝", "自动候选暂未写入")):
+                return PENDING_RETRY_WINDOW_SECONDS
+            return 30 * 60
+
+        return await run_once(
+            fingerprint,
+            admitted_shortpath,
+            result_ttl_seconds=shortpath_result_ttl,
+        )
+    fingerprint = request_fingerprint(
+        content=content,
+        items=None,
+        auto=auto,
+        source=source,
+    )
+    return await run_once(
+        fingerprint,
+        lambda: grow_core(content, auto=auto, source=source),
+    )
