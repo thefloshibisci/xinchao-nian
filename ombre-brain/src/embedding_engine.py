@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import heapq
 import hashlib
 import json
 import logging
@@ -82,6 +83,16 @@ _MAX_INPUT_CHARS = 2000
 # content）。同一 (text, model) 恒定映射到同一向量，缓存最近 N 条查询结果即可
 # 把这些重复请求拦在进程内，不用每次都打真实向量 API。
 _QUERY_CACHE_MAXSIZE = 32
+
+# 向量检索不需要把整张 embeddings 表和所有 NumPy 中间对象同时留在内存里。
+# 小批次计算后只保留 top-k，适合 Zeabur 这类内存较紧的实例。
+_SEARCH_BATCH_ROWS = 32
+
+
+def _provider_input_identity(text: str) -> str:
+    """为服务商实际看到的输入生成有界缓存键，不滞留整段桶正文。"""
+    provider_text = (text or "")[:_MAX_INPUT_CHARS]
+    return hashlib.sha256(provider_text.encode("utf-8")).hexdigest()
 
 
 def _norm_model(name: str) -> str:
@@ -295,7 +306,12 @@ class GeminiNativeEmbeddingEngine(BaseEmbeddingEngine):
         payload = {"content": {"parts": [{"text": text[:_MAX_INPUT_CHARS]}]}}
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as c:
-                r = await c.post(url, params={"key": self.api_key}, json=payload)
+                # API key 放请求头，避免出现在代理访问日志、URL 追踪和错误回显里。
+                r = await c.post(
+                    url,
+                    headers={"x-goog-api-key": self.api_key},
+                    json=payload,
+                )
                 r.raise_for_status()
             values = r.json().get("embedding", {}).get("values", [])
             if values and len(values) != self._dim:
@@ -333,7 +349,8 @@ class EmbeddingEngine:
 
     def __init__(self, config: dict):
         self.v3_runtime = None
-        # 进程内小容量 LRU：text -> embedding，去重短时间内的重复向量请求。
+        # 进程内小容量 LRU：provider 输入摘要 -> embedding。后端只会看到前
+        # _MAX_INPUT_CHARS 个字符，缓存键也遵守同一边界，避免长桶正文滞留内存。
         self._query_cache: "OrderedDict[str, list[float]]" = OrderedDict()
         embed_cfg = config.get("embedding", {}) or {}
         timeout_seconds = positive_float(embed_cfg.get("timeout_seconds"), _API_TIMEOUT_SECONDS)
@@ -586,14 +603,15 @@ class EmbeddingEngine:
     async def _generate_async(self, text: str) -> list[float]:
         if not self._backend:
             return []
-        cached = self._query_cache.get(text)
+        cache_identity = _provider_input_identity(text)
+        cached = self._query_cache.get(cache_identity)
         if cached is not None:
-            self._query_cache.move_to_end(text)
+            self._query_cache.move_to_end(cache_identity)
             return list(cached)
         embedding = await self._backend.generate_async(text)
         if embedding:
-            self._query_cache[text] = list(embedding)
-            self._query_cache.move_to_end(text)
+            self._query_cache[cache_identity] = list(embedding)
+            self._query_cache.move_to_end(cache_identity)
             if len(self._query_cache) > _QUERY_CACHE_MAXSIZE:
                 self._query_cache.popitem(last=False)
         return embedding
@@ -732,84 +750,102 @@ class EmbeddingEngine:
         """Return ranked neighbors, surfacing provider failures to the caller."""
         if not self.enabled:
             raise RuntimeError("embedding is disabled")
+        if top_k <= 0:
+            return []
+
+        # 先确认索引非空，但不把整个表读进 Python；这对大库尤其重要。
         conn = sqlite3.connect(self.db_path)
         try:
-            rows = conn.execute(
-                "SELECT bucket_id, embedding, meaning_embedding FROM embeddings"
-            ).fetchall()
+            has_rows = conn.execute("SELECT 1 FROM embeddings LIMIT 1").fetchone()
         finally:
             conn.close()
-        if not rows:
+        if not has_rows:
             return []
 
         query_embedding = await self._generate_async(query)
         if not query_embedding:
             raise RuntimeError("embedding provider returned an empty query vector")
 
-        bucket_ids: list[str] = []
-        best_scores: list[float | None] = []
-        candidate_vectors: list[list[float]] = []
-        candidate_owners: list[int] = []
+        # 只保留 top-k；同分时沿用 SQLite 行序，保持原先稳定排序行为。
+        top_results: list[tuple[float, int, str]] = []
+        row_index = 0
         query_dim = len(query_embedding)
-        for bucket_id, emb_json, meaning_emb_json in rows:
-            # Miss: 一个桶可能同时有 content 向量和 meaning 向量，取相似度较高的
-            # 那一个作为该桶的匹配分——这样一句 meaning 也能单独被检索命中，
-            # 不会被更长的 content 向量稀释掉。
-            owner = len(bucket_ids)
-            bucket_ids.append(bucket_id)
-            best_scores.append(None)
-            for label, raw_embedding in (
-                ("embedding", emb_json),
-                ("meaning embedding", meaning_emb_json),
-            ):
-                if not raw_embedding:
-                    continue
-                try:
-                    stored_embedding = json.loads(raw_embedding)
-                    if not isinstance(stored_embedding, list):
-                        raise TypeError(
-                            f"embedding is {type(stored_embedding).__name__}, not list"
-                        )
-                    if not stored_embedding:
-                        continue
-                    stored_embedding = [float(value) for value in stored_embedding]
-                except (json.JSONDecodeError, ValueError, TypeError) as _emb_exc:
-                    logger.warning(
-                        f"[embedding] Skipping malformed {label} for {bucket_id!r}: "
-                        f"{type(_emb_exc).__name__}: {_emb_exc}"
-                    )
-                    continue
-                if len(stored_embedding) != query_dim:
-                    # Preserve the pairwise helper's existing contract: a
-                    # dimension mismatch contributes a 0.0 score.
-                    logger.warning(
-                        f"[embedding] {label} dimension mismatch for {bucket_id!r}: "
-                        f"stored={len(stored_embedding)}, query={query_dim}"
-                    )
-                    current = best_scores[owner]
-                    best_scores[owner] = 0.0 if current is None else max(current, 0.0)
-                    continue
-                candidate_vectors.append(stored_embedding)
-                candidate_owners.append(owner)
-
-        if candidate_vectors:
-            similarities = self._cosine_similarity_batch(
-                query_embedding, candidate_vectors
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.execute(
+                "SELECT bucket_id, embedding, meaning_embedding FROM embeddings"
             )
-            for owner, similarity in zip(candidate_owners, similarities):
-                score = float(similarity)
-                current = best_scores[owner]
-                best_scores[owner] = score if current is None else max(current, score)
+            while True:
+                rows = cursor.fetchmany(_SEARCH_BATCH_ROWS)
+                if not rows:
+                    break
 
-        results = [
-            (bucket_id, score)
-            for bucket_id, score in zip(bucket_ids, best_scores)
-            if score is not None
-        ]
-        # Python's sort is stable, preserving SQLite row order for equal scores.
-        # This avoids argpartition's nondeterministic tie-boundary behavior.
-        results.sort(key=lambda item: item[1], reverse=True)
-        return results[:top_k]
+                bucket_ids: list[str] = []
+                best_scores: list[float | None] = []
+                candidate_vectors: list[list[float]] = []
+                candidate_owners: list[int] = []
+                for bucket_id, emb_json, meaning_emb_json in rows:
+                    owner = len(bucket_ids)
+                    bucket_ids.append(bucket_id)
+                    best_scores.append(None)
+                    # 一个桶同时有 content/meaning 时取较高分，避免长正文稀释 meaning。
+                    for label, raw_embedding in (
+                        ("embedding", emb_json),
+                        ("meaning embedding", meaning_emb_json),
+                    ):
+                        if not raw_embedding:
+                            continue
+                        try:
+                            stored_embedding = json.loads(raw_embedding)
+                            if not isinstance(stored_embedding, list):
+                                raise TypeError(
+                                    f"embedding is {type(stored_embedding).__name__}, not list"
+                                )
+                            if not stored_embedding:
+                                continue
+                            stored_embedding = [float(value) for value in stored_embedding]
+                        except (json.JSONDecodeError, ValueError, TypeError) as _emb_exc:
+                            logger.warning(
+                                f"[embedding] Skipping malformed {label} for {bucket_id!r}: "
+                                f"{type(_emb_exc).__name__}: {_emb_exc}"
+                            )
+                            continue
+                        if len(stored_embedding) != query_dim:
+                            logger.warning(
+                                f"[embedding] {label} dimension mismatch for {bucket_id!r}: "
+                                f"stored={len(stored_embedding)}, query={query_dim}"
+                            )
+                            current = best_scores[owner]
+                            best_scores[owner] = 0.0 if current is None else max(current, 0.0)
+                            continue
+                        candidate_vectors.append(stored_embedding)
+                        candidate_owners.append(owner)
+
+                if candidate_vectors:
+                    similarities = self._cosine_similarity_batch(
+                        query_embedding, candidate_vectors
+                    )
+                    for owner, similarity in zip(candidate_owners, similarities):
+                        score = float(similarity)
+                        current = best_scores[owner]
+                        best_scores[owner] = score if current is None else max(current, score)
+
+                for bucket_id, score in zip(bucket_ids, best_scores):
+                    current_index = row_index
+                    row_index += 1
+                    if score is None:
+                        continue
+                    # min-heap 根节点是当前最差项；后出现的同分项优先淘汰。
+                    entry = (score, -current_index, bucket_id)
+                    if len(top_results) < top_k:
+                        heapq.heappush(top_results, entry)
+                    elif entry > top_results[0]:
+                        heapq.heapreplace(top_results, entry)
+        finally:
+            conn.close()
+
+        top_results.sort(reverse=True)
+        return [(bucket_id, score) for score, _negative_index, bucket_id in top_results]
 
     async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
         """返回 [(bucket_id, similarity)]；失败时兼容旧调用方并返回空列表。"""

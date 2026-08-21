@@ -11,7 +11,7 @@ P0luz/Ombre-Brain（原项目, MIT, © P0lar1zzZ）
 - 原项目：https://github.com/P0luz/Ombre-Brain  （MIT，见 `LICENSE.P0luz-MIT`）
 - 二改仓库：CyberSealNull（fork of P0luz，见 `LICENSE.CyberSealNull` / `NOTICE.CyberSealNull.md`；
   其新增内容仅限个人 / 学习 / 非商业，商用需该 fork 维护者书面许可）
-- 本版本基线：`VERSION` = 2.6.5
+- 本版本基线：`VERSION` = 2.6.6
 
 ## 心潮念在此基础上的改动
 
@@ -31,6 +31,10 @@ P0luz/Ombre-Brain（原项目, MIT, © P0lar1zzZ）
    - 指纹额外纳入二改版的 `auto/source` 写入门卫参数，人工写入与后台候选不会被误判为
      同一请求；真实失败不缓存，仍可正常重试。短内容自动候选的门卫判断也位于防重边界内，
      暂缓/拒绝结果只短暂冷却，避免网络重试虚增候选出现次数，同时不长期锁住真实复现。
+
+4. **向量检索稳定性回移植**
+   - 吸收新版 OB 的内存边界与 Gemini 鉴权修复：检索按小批次计算、缓存键有界，且原生
+     Gemini embedding 不再把 API key 放进 URL。保持现有 `meaning` 双向量与心潮客户端协议不变。
 
 > OB 原生功能全部保留：breath / hold / grow / dream / trace / anchor / release / forget /
 > restore / purge / I / plan / letter / pulse 与 Dashboard。心潮念只做上述增量，不裁剪。

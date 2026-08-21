@@ -2,6 +2,14 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 2.6.6
+
+### 修复 / Fixed
+
+- Gemini 原生 embedding 请求改用 `x-goog-api-key` 请求头，不再把 key 放进 URL 查询参数，减少代理与访问日志泄露风险。
+- 向量查询按 32 行小批次计算并只保留 top-k，避免大记忆库检索时同时驻留整张 SQLite 表和完整 NumPy 矩阵；同分结果仍保持稳定的原行序。
+- embedding 查询缓存键只保留服务商实际接收的前 2000 个字符的 SHA-256，不再因长桶正文把整段文本留在进程内存中。
+
 ## 2.6.5
 
 ### 安全 / Security
