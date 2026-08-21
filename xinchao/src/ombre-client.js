@@ -60,7 +60,7 @@ export class OmbreClient {
         return await this.post({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call', params: { name, arguments: args } });
       } catch (error) {
         if (attempt || !/HTTP (400|404)/.test(error.message)) throw error;
-        this.sessionId = null;
+        this.resetSessionState();
       }
     }
     throw new Error('Ombre MCP call failed after session refresh');
@@ -81,7 +81,7 @@ export class OmbreClient {
           this.toolsCache = Array.isArray(tools) ? tools : [];
           return this.toolsCache;
         } catch (error) {
-          this.sessionId = null;
+          this.resetSessionState();
           if (attempt) throw error;
         }
       }
@@ -111,6 +111,17 @@ export class OmbreClient {
       return this.call('breath_search', { query, max_results: maxResults });
     }
     return this.call('breath', { query, max_results: maxResults, max_tokens: maxTokens });
+  }
+
+  // A new MCP session may expose a different tool set after Ombre restarts or
+  // redeploys. Never let a tools/list response from the old session survive
+  // the session refresh, otherwise the gateway can temporarily expose only a
+  // stale subset of tools until its process is restarted.
+  resetSessionState() {
+    this.sessionId = null;
+    this._initialized = false;
+    this.toolsCache = null;
+    this.memoryMetadataCache = null;
   }
 
   // feel 在 OB 里是专用记忆类型：普通精确 ID breath 会有意排除它。
@@ -275,20 +286,28 @@ export class OmbreClient {
 
     let byId = await this.memoryMetadata();
     if (!byId.has(id)) byId = await this.memoryMetadata({ refresh: true });
-    const star = byId.get(id);
-    if (!star) return { available: false, reason: 'not_found' };
 
     const maxTokens = Math.max(6000, Math.min(12000, Number(this.config.breathMaxTokens) || 6000));
-    const result = star.bucketType === 'feel'
-      ? await this.callFeelDetail(star, maxTokens)
-      : await this.callBreath({ query: id, maxResults: 1, maxTokens });
-    const surfaced = extractText(result);
-    if (!parseSurfacedBucketIds(surfaced).includes(id)) {
-      return { available: false, reason: 'not_found' };
+    // pulse is a deliberately cached metadata snapshot. A bucket can move
+    // between types (or be written by the other client) after that snapshot,
+    // which used to make the star-map detail page report a false not_found.
+    // Re-read pulse once when the exact read misses, then retry using the
+    // refreshed bucket type/tool route.
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const star = byId.get(id);
+      if (!star) return { available: false, reason: 'not_found' };
+      const result = star.bucketType === 'feel'
+        ? await this.callFeelDetail(star, maxTokens)
+        : await this.callBreath({ query: id, maxResults: 1, maxTokens });
+      const surfaced = extractText(result);
+      if (parseSurfacedBucketIds(surfaced).includes(id)) {
+        const preview = memoryPreview(surfaced, id);
+        if (!preview) return { available: false, reason: 'empty' };
+        return { available: true, id, preview, star };
+      }
+      if (attempt === 0) byId = await this.memoryMetadata({ refresh: true });
     }
-    const preview = memoryPreview(surfaced, id);
-    if (!preview) return { available: false, reason: 'empty' };
-    return { available: true, id, preview, star };
+    return { available: false, reason: 'not_found' };
   }
 
   async surfacedMetadata(text) {
