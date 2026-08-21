@@ -428,7 +428,7 @@ function removeExcludedDreamBuckets(text, excludedIds) {
 }
 
 // 从 breath 输出里把每条桶表头的 [domain:...] 解析出来，供记忆共振算亲和度。
-// OB 2.6.5+（breath-meta）在表头带 domain/tags；老输出没有时返回空数组，不影响。
+// OB 2.6.6+（breath-meta）在表头带 domain/tags；老输出没有时返回空数组，不影响。
 export function parseSurfacedBucketIds(text) {
   const ids = [];
   const re = /\[bucket_id:([A-Za-z0-9._-]{1,160})\]/g;
