@@ -217,39 +217,45 @@ def prepare_summaries(
         encoding="utf-8",
     )
 
+    def write_summary_buckets(items: list[dict[str, Any]], bucket_dir: Path) -> list[Path]:
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+        bucket_paths: list[Path] = []
+        for item in items:
+            bucket_id = item["migration_id"]
+            content = str(item["content"] or "").strip()
+            metadata = {
+                "id": bucket_id,
+                "name": f"旧摘要审阅 {item['created_at'][:10]}",
+                "type": "dynamic",
+                "domain": ["旧记忆摘要"],
+                "tags": ["supabase迁移", "待审阅", "旧摘要"],
+                "importance": 2 if item["review_status"] == "candidate" else 1,
+                "valence": 0.5,
+                "arousal": 0.3,
+                "resolved": True,
+                "dont_surface": True,
+                "pinned": False,
+                "created": item["created_at"],
+                "last_active": item["created_at"],
+                "source": item["source"],
+                "source_ids": item["source_ids"],
+                "source_review_status": item["review_status"],
+                "migration_state": "review_pending",
+            }
+            body = (
+                "这是一条从 Supabase 搬回的旧摘要，尚未晋升为日常主动记忆。"
+                "它默认只供明确搜索和人工审阅。\n\n"
+                f"{content}"
+            )
+            path = bucket_dir / f"{bucket_id}.md"
+            path.write_text(markdown_frontmatter(metadata, body), encoding="utf-8", newline="\n")
+            bucket_paths.append(path)
+        return bucket_paths
+
+    all_bucket_dir = output_dir / "summary-review-buckets"
+    all_bucket_paths = write_summary_buckets(queue, all_bucket_dir)
     trial_bucket_dir = output_dir / "trial-summary-buckets"
-    trial_bucket_dir.mkdir(parents=True, exist_ok=True)
-    trial_bucket_paths: list[Path] = []
-    for item in trial:
-        bucket_id = item["migration_id"]
-        content = str(item["content"] or "").strip()
-        metadata = {
-            "id": bucket_id,
-            "name": f"旧摘要审阅 {item['created_at'][:10]}",
-            "type": "dynamic",
-            "domain": ["旧记忆摘要"],
-            "tags": ["supabase迁移", "待审阅", "旧摘要"],
-            "importance": 2 if item["review_status"] == "candidate" else 1,
-            "valence": 0.5,
-            "arousal": 0.3,
-            "resolved": True,
-            "dont_surface": True,
-            "pinned": False,
-            "created": item["created_at"],
-            "last_active": item["created_at"],
-            "source": item["source"],
-            "source_ids": item["source_ids"],
-            "source_review_status": item["review_status"],
-            "migration_state": "review_pending",
-        }
-        body = (
-            "这是一条从 Supabase 搬回的旧摘要，尚未晋升为日常主动记忆。"
-            "它默认只供明确搜索和人工审阅。\n\n"
-            f"{content}"
-        )
-        path = trial_bucket_dir / f"{bucket_id}.md"
-        path.write_text(markdown_frontmatter(metadata, body), encoding="utf-8", newline="\n")
-        trial_bucket_paths.append(path)
+    trial_bucket_paths = write_summary_buckets(trial, trial_bucket_dir)
 
     return {
         "input_records": len(records),
@@ -260,6 +266,8 @@ def prepare_summaries(
         "trial_records": len(trial),
         "review_queue": file_info(queue_path),
         "trial_file": file_info(trial_path),
+        "review_bucket_directory": str(all_bucket_dir.resolve()),
+        "review_bucket_files_sha256": stable_directory_hash(all_bucket_paths),
         "trial_bucket_directory": str(trial_bucket_dir.resolve()),
         "trial_bucket_files_sha256": stable_directory_hash(trial_bucket_paths),
     }
@@ -486,6 +494,12 @@ def prepare(
             output_dir / "ombre-import-chat-cold-archive.zip",
             created_at=created_at,
             label="chat-cold-archive",
+        ),
+        "summary_review_full": build_import_archive(
+            Path(summaries["review_bucket_directory"]),
+            output_dir / "ombre-import-summary-review-full.zip",
+            created_at=created_at,
+            label="summary-review-full",
         ),
         "summary_trial": build_import_archive(
             Path(summaries["trial_bucket_directory"]),

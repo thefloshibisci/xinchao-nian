@@ -83,6 +83,12 @@ class PrepareSupabaseMigrationTest(unittest.TestCase):
             self.assertEqual(manifest["chat_archive"]["indexed_records"], 2)
             self.assertEqual(manifest["summaries"]["review_queue_records"], 1)
             self.assertEqual(manifest["summaries"]["exact_duplicates_collapsed"], 1)
+            self.assertEqual(
+                manifest["import_packages"]["summary_review_full"]["bucket_count"], 1
+            )
+            self.assertTrue(
+                manifest["import_packages"]["summary_review_full"]["integrity_verified"]
+            )
             bucket = next((output / "chat-archive-buckets").glob("*.md"))
             text = bucket.read_text(encoding="utf-8")
             self.assertIn("dont_surface: true", text)
@@ -91,6 +97,13 @@ class PrepareSupabaseMigrationTest(unittest.TestCase):
             queue = json.loads((output / "summary-review-queue.jsonl").read_text(encoding="utf-8"))
             self.assertEqual(queue["review_status"], "candidate")
             self.assertEqual(queue["source_ids"], ["s1", "s2"])
+            summary_bucket = next((output / "summary-review-buckets").glob("*.md"))
+            summary_text = summary_bucket.read_text(encoding="utf-8")
+            self.assertIn("dont_surface: true", summary_text)
+            self.assertIn("resolved: true", summary_text)
+            self.assertIn('source_ids: ["s1", "s2"]', summary_text)
+            self.assertIn('source_review_status: "candidate"', summary_text)
+            self.assertIn('migration_state: "review_pending"', summary_text)
 
     def test_rejects_duplicate_source_ids(self):
         with tempfile.TemporaryDirectory() as raw_tmp:
