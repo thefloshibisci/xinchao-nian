@@ -106,13 +106,22 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/buckets", methods=["GET"])
     async def api_buckets(request: Request) -> Response:
-        """List all buckets with metadata (no content for efficiency)."""
+        """List bucket metadata without forcing an archive scan.
+
+        The dashboard's first screen only needs active buckets.  Archived
+        Markdown is an intentionally separate, cold path because a large
+        archive (or a legacy malformed file in it) must not hold the whole
+        dashboard on ``Loading``.  Callers that explicitly need the archive
+        can opt in with ``?include_archive=1``.
+        """
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
             return err
         try:
-            all_buckets = await sh.bucket_mgr.list_all(include_archive=True)
+            include_archive = request.query_params.get("include_archive", "")
+            include_archive = include_archive.lower() in {"1", "true", "yes"}
+            all_buckets = await sh.bucket_mgr.list_all(include_archive=include_archive)
             result = []
             for b in all_buckets:
                 meta = b.get("metadata", {})

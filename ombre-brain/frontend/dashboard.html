@@ -4160,8 +4160,13 @@ function doSearch() {
 }
 
 async function loadBuckets() {
+  var controller = new AbortController();
+  var timer = setTimeout(function() { try { controller.abort(); } catch (_) {} }, 15000);
   try {
-    const res = await fetch(BASE + '/api/buckets');
+    // The first view must stay on the warm active-bucket path. Archived
+    // files are cold storage and are not needed to render imported memories.
+    const res = await authFetch(BASE + '/api/buckets?include_archive=0', { signal: controller.signal });
+    if (!res) return;
     const data = await res.json();
     if (!res.ok || !Array.isArray(data)) {
       throw new Error((data && data.error) ? data.error : `HTTP ${res.status}`);
@@ -4171,7 +4176,12 @@ async function loadBuckets() {
     buildFilters();
     renderBuckets(allBuckets);
   } catch (e) {
-    document.getElementById('bucket-list').innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
+    const message = e && e.name === 'AbortError'
+      ? '记忆桶加载超时，请稍后重试 / Bucket loading timed out'
+      : ('加载失败: ' + esc(e.message));
+    document.getElementById('bucket-list').innerHTML = '<div class="loading">' + message + '</div>';
+  } finally {
+    clearTimeout(timer);
   }
 }
 

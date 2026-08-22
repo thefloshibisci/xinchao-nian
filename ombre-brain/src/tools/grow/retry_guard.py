@@ -93,7 +93,7 @@ async def run_once(
         expired = [
             key
             for key, (finished_at, ttl_seconds, _result) in state.completed.items()
-            if now - finished_at > ttl_seconds
+            if now - finished_at >= ttl_seconds
         ]
         for key in expired:
             state.completed.pop(key, None)
