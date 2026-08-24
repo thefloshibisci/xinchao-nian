@@ -56,9 +56,10 @@ copy.
 2. Create the separate Xinchao service from the root `Dockerfile` with its own state volume. Do not select or edit `xinchao-nian-caric`.
 3. Expose the OB container port `8000` to the project network only; do not make it the public MCP connector.
 4. Configure private service-to-service addresses and independent secrets. Run `node tools/vnext_config_check.mjs ob` and `node tools/vnext_config_check.mjs xinchao` from private environment sessions before saving variables.
-5. Run `node tools/vnext_preflight.mjs` against the public Xinchao URL and, if available, the private OB URL.
-6. Keep OB writes disabled until the test-data copy is ready. Then enable writes only for the isolated copy and run the acceptance checklist.
-7. Do not discuss a production migration until both phone and desktop MCP acceptance reports are complete.
+5. From a clean checkout, run `node tools/vnext_topology_check.mjs`; this is an offline guard against accidentally assigning `/ombre-brain/Dockerfile` to the public service.
+6. Run `node tools/vnext_preflight.mjs` against the public Xinchao URL and, if available, the private OB URL.
+7. Keep OB writes disabled until the test-data copy is ready. Then enable writes only for the isolated copy and run the acceptance checklist.
+8. Do not discuss a production migration until both phone and desktop MCP acceptance reports are complete.
 
 ## Read-only preflight
 

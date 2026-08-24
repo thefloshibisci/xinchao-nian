@@ -30,6 +30,7 @@ jobs:
       - run: node --check src/server.js
       - run: node --check src/ombre-client.js
 
+      - run: node ../tools/vnext_topology_check.mjs
   standalone-image:
     runs-on: ubuntu-latest
     steps:
