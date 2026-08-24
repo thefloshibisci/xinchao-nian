@@ -68,6 +68,7 @@ test('keeps the last known OB tool schema during a transient outage', async () =
     token: '',
     readEnabled: true,
     writeEnabled: true,
+    toolsListRetryDelayMs: 0,
   });
 
   let calls = 0;
@@ -89,6 +90,6 @@ test('keeps the last known OB tool schema during a transient outage', async () =
 
   assert.deepEqual(first, [{ name: 'breath' }]);
   assert.deepEqual(duringRestart, [{ name: 'breath' }]);
-  assert.equal(calls, 3, 'the failed refresh retries once before using the stale schema');
+  assert.equal(calls, 4, 'the failed refresh retries twice before using the stale schema');
   assert.equal(ombre.toolsCache, null, 'stale fallback must not masquerade as a healthy current-session cache');
 });

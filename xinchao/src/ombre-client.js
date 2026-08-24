@@ -1,5 +1,21 @@
 import { planRecall, withRecallPolicyHint } from './recall-policy.js';
 
+const TOOLS_LIST_MAX_ATTEMPTS = 3;
+const TOOLS_LIST_RETRY_DELAYS_MS = [150, 400];
+const RETRYABLE_READ_STATUSES = new Set([400, 404, 408, 425, 429, 500, 502, 503, 504]);
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function retryableToolsListError(error) {
+  if (RETRYABLE_READ_STATUSES.has(Number(error?.status))) return true;
+  // Fetch failures and timeouts do not have an HTTP status. They are safe to
+  // retry here because tools/list is read-only; tools/call deliberately does
+  // not use this policy because a write could be duplicated.
+  return error?.status == null;
+}
+
 export class OmbreClient {
   constructor(config) {
     this.config = config;
@@ -28,7 +44,11 @@ export class OmbreClient {
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(15000)
     });
-    if (!response.ok) throw new Error(`Ombre MCP failed: HTTP ${response.status}`);
+    if (!response.ok) {
+      const error = new Error(`Ombre MCP failed: HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
     this.sessionId = response.headers.get('mcp-session-id') ?? this.sessionId;
     if (!expectBody) return null;
     const text = await response.text();
@@ -77,7 +97,8 @@ export class OmbreClient {
     if (!refresh && this.toolsCache) return this.toolsCache;
     if (!refresh && this.toolsPromise) return this.toolsPromise;
     this.toolsPromise = (async () => {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
+      let lastError = null;
+      for (let attempt = 0; attempt < TOOLS_LIST_MAX_ATTEMPTS; attempt += 1) {
         try {
           await this.initialize();
           const raw = await this.post({ jsonrpc: '2.0', id: Date.now(), method: 'tools/list', params: {} });
@@ -86,18 +107,22 @@ export class OmbreClient {
           this.lastKnownTools = this.toolsCache;
           return this.toolsCache;
         } catch (error) {
+          lastError = error;
           this.resetSessionState();
-          if (attempt) {
-            // tools/list is read-only. During an OB restart, retain the last
-            // successful schema so the public Xinchao MCP remains usable.
-            // Calls to an actually unavailable OB still surface their own
-            // error; this only prevents a transient empty tools/list.
-            if (Array.isArray(this.lastKnownTools)) return this.lastKnownTools;
-            throw error;
+          if (!retryableToolsListError(error)) throw error;
+          if (attempt < TOOLS_LIST_MAX_ATTEMPTS - 1) {
+            const delay = TOOLS_LIST_RETRY_DELAYS_MS[attempt] ?? TOOLS_LIST_RETRY_DELAYS_MS.at(-1);
+            const configuredDelay = Number(this.config.toolsListRetryDelayMs);
+            await sleep(Number.isFinite(configuredDelay) ? Math.max(0, configuredDelay) : delay);
           }
         }
       }
-      return Array.isArray(this.lastKnownTools) ? this.lastKnownTools : [];
+      // tools/list is read-only. During an OB restart, retain the last
+      // successful schema so the public Xinchao MCP remains usable. Calls to
+      // an actually unavailable OB still surface their own error; this only
+      // prevents a transient empty tools/list.
+      if (Array.isArray(this.lastKnownTools)) return this.lastKnownTools;
+      throw lastError ?? new Error('Ombre MCP tools/list failed');
     })().finally(() => { this.toolsPromise = null; });
     return this.toolsPromise;
   }
