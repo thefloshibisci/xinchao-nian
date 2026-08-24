@@ -160,9 +160,15 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/bucket/{bucket_id}", methods=["GET"])
     async def api_bucket_detail(request: Request) -> Response:
-        """Get full bucket content by ID."""
+        """Get full bucket content by ID.
+
+        The sidecar service token is accepted only here so Xinchao can use one
+        exact-read contract for every bucket type.  This is especially needed
+        for feel/plan/letter/i, whose MCP surfacing rules intentionally differ.
+        Browser Dashboard sessions remain valid as before.
+        """
         from starlette.responses import JSONResponse
-        err = sh._require_auth(request)
+        err = sh._require_service_or_dashboard_auth(request)
         if err:
             return err
         bucket_id = request.path_params["bucket_id"]

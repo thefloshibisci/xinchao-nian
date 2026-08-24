@@ -8,6 +8,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from web import buckets as buckets_web
+from web import _shared as shared_web
 
 
 class _RouteRegistry:
@@ -78,6 +79,35 @@ class DashboardBucketListTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bucket_manager.include_archive_calls, [True])
 
 
+class ServiceTokenAuthTests(unittest.TestCase):
+    def setUp(self):
+        import os
+
+        self.old_token = os.environ.get("OMBRE_MCP_SERVICE_TOKEN")
+        os.environ["OMBRE_MCP_SERVICE_TOKEN"] = "s" * 40
+
+    def tearDown(self):
+        import os
+
+        if self.old_token is None:
+            os.environ.pop("OMBRE_MCP_SERVICE_TOKEN", None)
+        else:
+            os.environ["OMBRE_MCP_SERVICE_TOKEN"] = self.old_token
+
+    def test_service_token_is_limited_to_strong_bearer_values(self):
+        authorized = _request_with_headers(
+            {"authorization": f"Bearer {'s' * 40}"}
+        )
+        self.assertTrue(shared_web._is_service_token_authenticated(authorized))
+        self.assertIsNone(
+            shared_web._require_service_or_dashboard_auth(authorized)
+        )
+        self.assertFalse(shared_web._is_service_token_authenticated(
+            _request_with_headers({"authorization": "Bearer wrong"})))
+        self.assertFalse(shared_web._is_service_token_authenticated(
+            _request_with_headers({"authorization": f"Basic {'s' * 40}"})))
+
+
 def _request(query_string):
     from starlette.requests import Request
 
@@ -88,6 +118,20 @@ def _request(query_string):
             "path": "/api/buckets",
             "query_string": query_string.encode("ascii"),
             "headers": [],
+        }
+    )
+
+
+def _request_with_headers(headers):
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/bucket/example",
+            "query_string": b"",
+            "headers": [(key.lower().encode("ascii"), value.encode("ascii")) for key, value in headers.items()],
         }
     )
 

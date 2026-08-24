@@ -8,20 +8,29 @@ test('pulse text becomes a metadata-only memory map', () => {
 固化桶：2
 动态桶：4
 归档桶：1
+feel 桶：1
+plan 桶：1
+letter 桶：1
 总占用：2.5 MB
 📌 [core123] 《钉住核心》 主题:恋爱,成长 情感:V0.9/A0.7 重要:10 权重:80 标签:共同记忆,承诺,成长
 📦 [long456] 《普通长期》 主题:恋爱 情感:V0.8/A0.4 重要:8 权重:45 标签:共同记忆,承诺,成长
 🫧 [feel_202608181030_V085] 《一阵心潮》 主题:生活 情感:V0.5/A0.8 重要:7 权重:30 标签:感受,晚风
 📋 [plan777] 《明天的计划》 主题:生活 情感:V0.6/A0.3 重要:5 权重:18 标签:计划,安排
 💌 [letter777] 《没有寄出的信》 主题:恋爱 情感:V0.7/A0.6 重要:6 权重:24 标签:信件,心事
+🪞 [self777] 《逐渐认出的自己》 主题:self 情感:V0.5/A0.3 重要:6 权重:20 标签:__i__,aspect:becoming
 💭 [live789] 《动态记忆》 主题:生活 情感:V0.5/A0.2 重要:4 权重:12 标签:吃饭,天气,通勤
 🗄️ [old999] 《归档记忆》 主题:工作 情感:V0.4/A0.5 重要:3 权重:9 标签:项目,会议,进度
 ✅ [done888] 《已经解决》 [已解决] 主题:生活 情感:V0.6/A0.3 重要:2 权重:5 标签:琐事
+=== I（1 条）===
 `);
 
   assert.equal(result.available, true);
-  assert.equal(result.total, 8);
+  assert.equal(result.total, 9);
   assert.equal(result.stats.pinned, 2);
+  assert.equal(result.stats.feel, 1);
+  assert.equal(result.stats.plan, 1);
+  assert.equal(result.stats.letter, 1);
+  assert.equal(result.stats.i, 1);
   assert.equal(result.stars[0].pinned, true);
   assert.equal(result.stars[0].bucketType, 'permanent');
   assert.equal(result.stars[1].pinned, false);
@@ -30,9 +39,10 @@ test('pulse text becomes a metadata-only memory map', () => {
   assert.equal(result.stars[2].bucketType, 'feel');
   assert.equal(result.stars[3].bucketType, 'plan');
   assert.equal(result.stars[4].bucketType, 'letter');
-  assert.equal(result.stars[5].bucketType, 'dynamic');
-  assert.equal(result.stars[6].bucketType, 'archive');
-  assert.equal(result.stars[7].resolved, true);
+  assert.equal(result.stars[5].bucketType, 'i');
+  assert.equal(result.stars[6].bucketType, 'dynamic');
+  assert.equal(result.stars[7].bucketType, 'archive');
+  assert.equal(result.stars[8].resolved, true);
   assert.equal(result.stars[0].driveSnapshot, null);
   assert.equal(result.stars[0].historical, true);
   assert.equal(result.edges.length, 1);
@@ -212,14 +222,30 @@ test('transitional Ombre falls back to the legacy feel domain after dedicated se
 });
 
 test('memory detail rejects unknown ids without turning Dashboard into a search proxy', async () => {
-  const ombre = new OmbreClient({ readEnabled: true, writeEnabled: false });
+  const ombre = new OmbreClient({
+    url: 'https://ombre.example/mcp',
+    token: 'x'.repeat(40),
+    readEnabled: true,
+    writeEnabled: false,
+  });
   ombre.memoryMap = async () => ({ stars: [{ id: 'known-memory', title: 'known' }] });
-  let calls = 0;
-  ombre.call = async () => { calls += 1; };
+  let mcpCalls = 0;
+  let httpCalls = 0;
+  ombre.call = async () => { mcpCalls += 1; };
 
-  assert.deepEqual(await ombre.memoryDetail('../secret'), { available: false, reason: 'invalid_id' });
-  assert.deepEqual(await ombre.memoryDetail('missing-memory'), { available: false, reason: 'not_found' });
-  assert.equal(calls, 0);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    httpCalls += 1;
+    throw new Error('unknown IDs must not reach the exact detail endpoint');
+  };
+  try {
+    assert.deepEqual(await ombre.memoryDetail('../secret'), { available: false, reason: 'invalid_id' });
+    assert.deepEqual(await ombre.memoryDetail('missing-memory'), { available: false, reason: 'not_found' });
+    assert.equal(mcpCalls, 0);
+    assert.equal(httpCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('memory preview removes exact-read wrappers and stops before another bucket', () => {
@@ -232,3 +258,83 @@ test('memory preview removes exact-read wrappers and stops before another bucket
 另一条正文
 `, 'first-memory'), '真正正文');
 });
+
+for (const bucketType of ['dynamic', 'permanent', 'feel', 'plan', 'letter', 'i']) {
+  test(`${bucketType} detail prefers the exact read-only HTTP endpoint`, async () => {
+    const ombre = new OmbreClient({
+      url: 'https://ombre.example/mcp',
+      token: 'x'.repeat(40),
+      readEnabled: true,
+      writeEnabled: false,
+      breathMaxTokens: 800,
+    });
+    ombre.memoryMap = async () => ({
+      stars: [{ id: `${bucketType}_exact_target`, title: '目标', bucketType }],
+    });
+    let mcpCalls = 0;
+    ombre.call = async () => {
+      mcpCalls += 1;
+      throw new Error('MCP fallback should not run after an exact HTTP hit');
+    };
+
+    const originalFetch = globalThis.fetch;
+    let request = null;
+    globalThis.fetch = async (input, init) => {
+      request = { input: String(input), init };
+      return {
+        ok: true,
+        async json() {
+          return {
+            id: `${bucketType}_exact_target`,
+            metadata: { type: bucketType },
+            content: '精确读取到的特殊桶正文',
+          };
+        },
+      };
+    };
+    try {
+      const detail = await ombre.memoryDetail(`${bucketType}_exact_target`);
+      assert.equal(detail.available, true);
+      assert.equal(detail.preview, '精确读取到的特殊桶正文');
+      assert.equal(mcpCalls, 0);
+      assert.equal(request.input, `https://ombre.example/api/bucket/${bucketType}_exact_target`);
+      assert.equal(request.init.headers.Authorization, `Bearer ${'x'.repeat(40)}`);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
+for (const status of [401, 404]) {
+  test(`exact HTTP ${status} keeps the MCP fallback path`, async () => {
+    const ombre = new OmbreClient({
+      url: 'https://ombre.example/mcp',
+      token: 'x'.repeat(40),
+      readEnabled: true,
+      writeEnabled: false,
+      breathMaxTokens: 800,
+    });
+    ombre.memoryMap = async () => ({
+      stars: [{ id: 'plan_fallback_target', title: '目标计划', bucketType: 'plan' }],
+    });
+    ombre.callBreath = async (args) => ({
+      result: {
+        content: [{
+          type: 'text',
+          text: `[bucket_id:plan_fallback_target]\nMCP 回退正文\n👣 Footprint：刚刚想起`,
+        }],
+      },
+      args,
+    });
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: false, status });
+    try {
+      const detail = await ombre.memoryDetail('plan_fallback_target');
+      assert.equal(detail.available, true);
+      assert.equal(detail.preview, 'MCP 回退正文');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}

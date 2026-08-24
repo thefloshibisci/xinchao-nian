@@ -157,6 +157,39 @@ export class OmbreClient {
     return result;
   }
 
+  async fetchBucketDetail(bucketId) {
+    const id = String(bucketId ?? '').trim();
+    const token = String(this.config.token ?? '').trim();
+    const rawUrl = String(this.config.url ?? '').trim();
+    if (!id || !token || !rawUrl) return null;
+
+    let url;
+    try {
+      const mcpUrl = new URL(rawUrl);
+      url = new URL(`/api/bucket/${encodeURIComponent(id)}`, mcpUrl.origin);
+    } catch {
+      return null;
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+          'X-Ombre-Caller': 'dynamic-mind',
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) return null;
+      const payload = await response.json();
+      if (String(payload?.id ?? '').trim() !== id) return null;
+      return payload;
+    } catch {
+      return null;
+    }
+  }
+
   async recentMaterial(drives = []) {
     const policy = planRecall({ purpose: 'continuity', maxResults: this.config.breathMaxResults, maxTokens: this.config.breathMaxTokens });
     const result = await this.callBreath({
@@ -278,7 +311,9 @@ export class OmbreClient {
   }
 
   // 星图列表继续只含元数据；用户点开某颗星时才按完整 bucket id 读取一次。
-  // id 必须先存在于 pulse 元数据中，避免把 Dashboard 变成任意 breath 查询代理。
+  // 所有已知类型都先走同一个只读详情端点，避免 feel/plan/letter/i 各自依赖
+  // 不同且不完整的 MCP 搜索语义。id 必须先存在于 pulse 元数据中，避免把
+  // Dashboard 变成任意 bucket 文件读取代理。
   async memoryDetail(bucketId) {
     if (!this.config.readEnabled) return { available: false, reason: 'not_configured' };
     const id = String(bucketId ?? '').trim();
@@ -296,6 +331,13 @@ export class OmbreClient {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const star = byId.get(id);
       if (!star) return { available: false, reason: 'not_found' };
+      const exact = await this.fetchBucketDetail(id);
+      if (exact) {
+        const exactText = `[exact_bucket_id:true] [bucket_id:${id}]\n${String(exact.content ?? '')}`;
+        const preview = memoryPreview(exactText, id);
+        if (preview) return { available: true, id, preview, star };
+      }
+
       const result = star.bucketType === 'feel'
         ? await this.callFeelDetail(star, maxTokens)
         : await this.callBreath({ query: id, maxResults: 1, maxTokens });
@@ -511,6 +553,7 @@ function memoryTypeFromIcon(icon) {
     case '🫧': return { bucketType: 'feel', pinned: false };
     case '📋': return { bucketType: 'plan', pinned: false };
     case '💌': return { bucketType: 'letter', pinned: false };
+    case '🪞': return { bucketType: 'i', pinned: false };
     case '🗄️': return { bucketType: 'archive', pinned: false };
     case '✅': return { bucketType: 'dynamic', pinned: false, resolved: true };
     default: return { bucketType: 'dynamic', pinned: false };
@@ -642,15 +685,27 @@ export function parseMemoryMapText(raw) {
   }
 
   const stats = {};
-  for (const [key, label] of [['pinned', '固化桶'], ['dynamic', '动态桶'], ['archived', '归档桶']]) {
+  for (const [key, label] of [
+    ['pinned', '固化桶'],
+    ['dynamic', '动态桶'],
+    ['archived', '归档桶'],
+    ['feel', 'feel 桶'],
+    ['plan', 'plan 桶'],
+    ['letter', 'letter 桶'],
+    ['i', 'I 桶'],
+  ]) {
     const match = text.match(new RegExp(`${label}[:：]\\s*(\\d+)`));
     if (match) stats[key] = Number(match[1]);
+  }
+  if (stats.i == null) {
+    const iSection = text.match(/===\s*I（(\d+)\s*条）===/);
+    if (iSection) stats.i = Number(iSection[1]);
   }
   const size = text.match(/总占用[:：]\s*([\d.]+\s*\w+)/);
   if (size) stats.size = size[1];
 
   const stars = [];
-  const line = /^[^\S\r\n]*(📌|📦|🫧|📋|💌|🗄️|✅|💭)?[^\S\r\n]*\[([A-Za-z0-9._-]{1,160})\](?:[^\S\r\n]*《([^》]*)》)?([^\r\n]*)/gmu;
+  const line = /^[^\S\r\n]*(📌|📦|🫧|📋|💌|🪞|🗄️|✅|💭)?[^\S\r\n]*\[([A-Za-z0-9._-]{1,160})\](?:[^\S\r\n]*《([^》]*)》)?([^\r\n]*)/gmu;
   let match;
   while ((match = line.exec(text)) !== null) {
     const [, icon, id, title, tail] = match;

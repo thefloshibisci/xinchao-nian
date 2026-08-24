@@ -38,6 +38,7 @@ import logging
 from starlette.requests import Request
 from starlette.responses import Response
 
+from auth_policy import MIN_SERVICE_TOKEN_LENGTH
 from ombrebrain.app.execution import ExecutionEnvelope
 from ombrebrain.policy.update_policy import evaluate_update_manifest as _evaluate_update_manifest
 
@@ -685,6 +686,25 @@ def _is_authenticated(request: Request) -> bool:
     return True
 
 
+def _is_service_token_authenticated(request: Request) -> bool:
+    """Allow the trusted sidecar token on narrowly-scoped read-only routes.
+
+    The MCP service token is intentionally not treated as a dashboard session
+    and is not accepted by the generic dashboard guard.  Keeping this check
+    separate prevents a sidecar credential from becoming a blanket Dashboard
+    API credential.
+    """
+    configured = str(os.environ.get("OMBRE_MCP_SERVICE_TOKEN", "") or "").strip()
+    if len(configured) < MIN_SERVICE_TOKEN_LENGTH:
+        return False
+    authorization = str(request.headers.get("authorization", "") or "").strip()
+    scheme, _, candidate = authorization.partition(" ")
+    candidate = candidate.strip()
+    if scheme.lower() != "bearer" or len(candidate) != len(configured):
+        return False
+    return hmac.compare_digest(candidate, configured)
+
+
 def _is_https_request(request: Request) -> bool:
     """Detect HTTPS through Cloudflare/reverse-proxy via X-Forwarded-Proto header."""
     proto = _trusted_forwarded_value(request, "x-forwarded-proto").lower()
@@ -721,3 +741,10 @@ def _require_auth(request: Request) -> Response | None:
             status_code=401,
         )
     return None
+
+
+def _require_service_or_dashboard_auth(request: Request) -> Response | None:
+    """Authenticate a sidecar read or a normal browser Dashboard session."""
+    if _is_service_token_authenticated(request):
+        return None
+    return _require_auth(request)
