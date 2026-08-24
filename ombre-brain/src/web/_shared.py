@@ -689,20 +689,41 @@ def _is_authenticated(request: Request) -> bool:
 def _is_service_token_authenticated(request: Request) -> bool:
     """Allow the trusted sidecar token on narrowly-scoped read-only routes.
 
+    A trusted sidecar (e.g. Xinchao) connects to OB via MCP using a static
+    token (OMBRE_MCP_TOKEN / config['mcp_token']).  That same token should also
+    authenticate read-only HTTP API routes such as /api/bucket/{id}, so the
+    star-map detail page can fetch bucket content without a separate
+    OMBRE_MCP_SERVICE_TOKEN that may never be configured.
+
     The MCP service token is intentionally not treated as a dashboard session
     and is not accepted by the generic dashboard guard.  Keeping this check
     separate prevents a sidecar credential from becoming a blanket Dashboard
     API credential.
     """
-    configured = str(os.environ.get("OMBRE_MCP_SERVICE_TOKEN", "") or "").strip()
-    if len(configured) < MIN_SERVICE_TOKEN_LENGTH:
-        return False
     authorization = str(request.headers.get("authorization", "") or "").strip()
-    scheme, _, candidate = authorization.partition(" ")
+    scheme, separator, candidate = authorization.partition(" ")
     candidate = candidate.strip()
-    if scheme.lower() != "bearer" or len(candidate) != len(configured):
+    if not separator or scheme.lower() != "bearer" or not candidate:
         return False
-    return hmac.compare_digest(candidate, configured)
+
+    configured_tokens: list[str] = []
+    service_token = str(os.environ.get("OMBRE_MCP_SERVICE_TOKEN", "") or "").strip()
+    if len(service_token) >= MIN_SERVICE_TOKEN_LENGTH:
+        configured_tokens.append(service_token)
+    mcp_token = (
+        str(os.environ.get("OMBRE_MCP_TOKEN", "") or "").strip()
+        or str(config.get("mcp_token", "") or "").strip()
+    )
+    if len(mcp_token) >= MIN_SERVICE_TOKEN_LENGTH:
+        configured_tokens.append(mcp_token)
+
+    if not configured_tokens:
+        return False
+
+    for configured in configured_tokens:
+        if len(candidate) == len(configured) and hmac.compare_digest(candidate, configured):
+            return True
+    return False
 
 
 def _is_https_request(request: Request) -> bool:
