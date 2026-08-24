@@ -61,3 +61,34 @@ test('an expired Ombre session reloads tools from the replacement session', asyn
   assert.equal(ombre.sessionId, 'new-session');
   assert.deepEqual(tools, [{ name: 'fresh_tool' }]);
 });
+
+test('keeps the last known OB tool schema during a transient outage', async () => {
+  const ombre = new OmbreClient({
+    url: 'http://ombre.invalid/mcp',
+    token: '',
+    readEnabled: true,
+    writeEnabled: true,
+  });
+
+  let calls = 0;
+  ombre.post = async (payload) => {
+    if (payload.method === 'initialize') {
+      ombre.sessionId = `session-${calls}`;
+      return { result: {} };
+    }
+    if (payload.method === 'tools/list') {
+      calls += 1;
+      if (calls === 1) return { result: { tools: [{ name: 'breath' }] } };
+      throw new Error('fetch failed: socket closed');
+    }
+    return null;
+  };
+
+  const first = await ombre.listTools();
+  const duringRestart = await ombre.listTools({ refresh: true });
+
+  assert.deepEqual(first, [{ name: 'breath' }]);
+  assert.deepEqual(duringRestart, [{ name: 'breath' }]);
+  assert.equal(calls, 3, 'the failed refresh retries once before using the stale schema');
+  assert.equal(ombre.toolsCache, null, 'stale fallback must not masquerade as a healthy current-session cache');
+});

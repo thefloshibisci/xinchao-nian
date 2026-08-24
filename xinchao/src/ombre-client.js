@@ -6,6 +6,10 @@ export class OmbreClient {
     this.sessionId = null;
     this.initializePromise = null;
     this.toolsCache = null;
+    // Keep the last successful tool schema across a session refresh. OB may
+    // restart briefly; serving a known-good read-only schema lets the gateway
+    // stay connectable instead of making clients cache an empty tool list.
+    this.lastKnownTools = null;
     this.toolsPromise = null;
     this.memoryMetadataCache = null;
     this.memoryMetadataPromise = null;
@@ -79,13 +83,21 @@ export class OmbreClient {
           const raw = await this.post({ jsonrpc: '2.0', id: Date.now(), method: 'tools/list', params: {} });
           const tools = raw?.result?.tools ?? raw?.tools ?? [];
           this.toolsCache = Array.isArray(tools) ? tools : [];
+          this.lastKnownTools = this.toolsCache;
           return this.toolsCache;
         } catch (error) {
           this.resetSessionState();
-          if (attempt) throw error;
+          if (attempt) {
+            // tools/list is read-only. During an OB restart, retain the last
+            // successful schema so the public Xinchao MCP remains usable.
+            // Calls to an actually unavailable OB still surface their own
+            // error; this only prevents a transient empty tools/list.
+            if (Array.isArray(this.lastKnownTools)) return this.lastKnownTools;
+            throw error;
+          }
         }
       }
-      return [];
+      return Array.isArray(this.lastKnownTools) ? this.lastKnownTools : [];
     })().finally(() => { this.toolsPromise = null; });
     return this.toolsPromise;
   }
