@@ -1,0 +1,13 @@
+{
+  "format": "ombre-media-rehydration-v1",
+  "items": [
+    {
+      "bucket_id": "replace-with-explicit-bucket-id",
+      "source_url": "https://example.invalid/path/to/image.png",
+      "filename": "image.png",
+      "type": "image/png",
+      "title": "optional title",
+      "note": "optional note"
+    }
+  ]
+}

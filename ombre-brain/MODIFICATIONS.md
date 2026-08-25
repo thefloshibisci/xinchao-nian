@@ -51,6 +51,25 @@ P0luz/Ombre-Brain（原项目, MIT, © P0lar1zzZ）
      `stored=true + sha256` 引用闭包，再按当前环境媒体目录恢复并重写稳定路径。
    - 旧版仅含历史 `path`、没有二进制成员的包仍可解析，但不会被误报为媒体二进制已恢复。
 
+7. **显式清单媒体再水化维护工具**
+   - `deploy/rehydrate_media.py` 只读取人工提供的 `ombre-media-rehydration-v1` JSON 清单；
+     不扫描现有记忆、不读取 Supabase、不从 bucket 正文自动提取或探测 URL。
+   - 默认运行是无网络 dry-run，仅校验 schema、bucket 存在性、已保存媒体和每桶容量；只有显式
+     `--apply` 才会进行 DNS、HTTPS 下载和写入。
+   - apply 拒绝用户信息、明文 HTTP、私有/回环/链路本地地址及不安全跳转；单项与整批均有限额，
+     可选 `expected_size` / `expected_sha256` 会在持久化前校验。
+   - 全部远端对象先下载并验证，之后才持久化媒体、生成全部 Markdown 并原子写入；下载、媒体
+     持久化或 Markdown 写入失败会保持/恢复原 Markdown，并清理本次新建媒体。
+   - 报告和错误只显示 URL 的 SHA-256 短摘要，不打印、写入或提交完整 URL、签名查询串。
+   - 示例清单见 `deploy/rehydrate_media.example.json`。用法：
+
+     ```bash
+     # 无网络 dry-run
+     python deploy/rehydrate_media.py --manifest manifest.json --buckets-dir /app/buckets
+
+     # 明确确认后才下载和写入
+     python deploy/rehydrate_media.py --manifest manifest.json --buckets-dir /app/buckets --apply
+     ```
 > OB 原生功能全部保留：breath / hold / grow / dream / trace / anchor / release / forget /
 > restore / purge / I / plan / letter / pulse 与 Dashboard。心潮念只做上述增量，不裁剪。
 
