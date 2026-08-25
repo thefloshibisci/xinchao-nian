@@ -21,11 +21,15 @@ const INTERACTION_TYPES = new Set([
 
 
 
-// 心潮念网关：对外暴露的 OB 记忆工具（精简集，purge/restore/letter/plan 不暴露）。
+// 心潮念网关：对外暴露经过审查的 OB 记忆工具。purge/restore 仍不暴露；
 // hold 保留（2026-08-09 复议：hold 有了 meaning 字段能补上下文，与 grow 不冲突——
 // 日常/日记整理走 grow，重要瞬间可用 hold 但必须写 meaning）。
 // 走代理转发到 OB；schema 在 tools/list 时动态从 OB 拉，永不漂移。
-export const OB_PROXY_TOOLS = ['breath', 'hold', 'grow', 'trace', 'forget', 'dream', 'anchor', 'release', 'I', 'pulse'];
+export const OB_PROXY_TOOLS = [
+  'breath', 'breath_search', 'breath_advanced',
+  'hold', 'grow', 'trace', 'forget', 'dream', 'anchor', 'release',
+  'I', 'pulse', 'plan', 'letter_write', 'letter_read',
+];
 const OB_PROXY_SET = new Set(OB_PROXY_TOOLS);
 
 
@@ -38,6 +42,8 @@ const OB_PROXY_SET = new Set(OB_PROXY_TOOLS);
 // 对外用中文标题 + 中文说明（内部名保持不变，用于协议路由）。让顾川看到的是"浮现记忆"而不是"breath"。
 const OB_TOOL_LABELS = {
   breath:  { title: '浮现记忆', description: '让当前最相关的长期记忆自然浮现，并带回近期梦境摘要与余韵。用于新窗口开始、上下文断层、或确需重新寻找相关记忆时；不要每条消息调用。' },
+  breath_search: { title: '定向检索记忆', description: '按关键词或语义定向检索长期记忆；只在问题依赖特定往事、感受或决定时调用。' },
+  breath_advanced: { title: '高级检索记忆', description: '使用 domain、tags、重要度、情感、目录模式或独立 token 预算精细检索长期记忆。' },
   hold:    { title: '沉淀一条', description: '当场存一条重要的短记忆（重要决定、关系变化、有长期意义的话或共同经历）。必须写 meaning 补上下文；不适合普通寒暄、临时信息或每一句对话。media 可直接传 http(s) 图片链接字符串，或 {url,title,note} 列表项；心潮会安全下载后交给 OB 永久保存。' },
   grow:    { title: '整理导入', description: '把一段整理好的内容（如当天日记）按有意义的小节导入，系统自动拆成多条并各自尝试合并。日常/日记整理走这条。' },
   trace:   { title: '追溯修改', description: '修改一条已存在记忆的字段（重要度、标签、domain、标记已放下/已消化、软删除等）。不要猜 id、不要自行改写正文。media_append/media_replace 可直接传 http(s) 图片链接字符串，或 {url,title,note} 列表项；心潮会安全下载后交给 OB 永久保存。' },
@@ -47,6 +53,9 @@ const OB_TOOL_LABELS = {
   release: { title: '解除锚点', description: '取消某条记忆的锚点标记。' },
   I:       { title: '自我沉淀', description: '自我认知先落成候选记忆，被多个不同日期的消化见证过才升级为长期。学习来源是时间和反复存活，不是谁的认可。' },
   pulse:   { title: '记忆脉动', description: '读取记忆库整体状态的脉搏（数量、分布等元信息）。' },
+  plan:    { title: '登记承诺', description: '登记待办、承诺或未闭环事项；完成、放弃或状态变化时应显式更新，不用于普通聊天。' },
+  letter_write: { title: '写一封信', description: '永久保存一封双方来信；原文不压缩、不合并、不衰减。只在确实要写信时调用。' },
+  letter_read: { title: '读历史信件', description: '按作者、日期或语义检索历史信件；无查询时读取最近来信。' },
 };
 function relabelOb(tool) {
   const lab = OB_TOOL_LABELS[tool?.name];

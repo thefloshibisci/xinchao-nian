@@ -118,6 +118,12 @@ https://xinchao.example.com/mcp
 
 `session_id` 是可选覆盖值。正常情况下服务端会使用 MCP 连接自带的稳定窗口 ID。
 
+启用 OB 读取后，心潮会在同一个 MCP 端点动态代理经过审查的记忆工具，并沿用 OB
+返回的实时 schema：`breath`、`breath_search`、`breath_advanced`、`hold`、`grow`、
+`trace`、`forget`、`dream`、`anchor`、`release`、`I`、`pulse`、`plan`、
+`letter_write`、`letter_read`。`purge` / `restore` 不经公网心潮代理；已经从新版 OB
+移除的 `source_read` 也不会在网关重新开放。
+
 通过心潮代理调用 OB 的 `hold` 或 `trace` 时，媒体也可以直接使用公开图片链接：
 
 ```json

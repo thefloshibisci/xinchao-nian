@@ -36,6 +36,12 @@ P0luz/Ombre-Brain（原项目, MIT, © P0lar1zzZ）
    - 吸收新版 OB 的内存边界与 Gemini 鉴权修复：检索按小批次计算、缓存键有界，且原生
      Gemini embedding 不再把 API key 放进 URL。保持现有 `meaning` 双向量与心潮客户端协议不变。
 
+5. **分拆 recall 工具兼容层**
+   - 在保留二改版统一参数化 `breath` 的同时，新增公开 `breath_search` 与
+     `breath_advanced` 薄封装；两者复用同一套检索、过滤、内存保护和逐字返回实现，不复制数据路径。
+   - 目的：兼容新版 OB 客户端的工具发现与回退顺序，同时不破坏已有客户端和迁移验收脚本。
+   - 不恢复新版已删除的 `source_read`；迁移冷档案继续使用完整 bucket ID 的受控定向检索。
+
 > OB 原生功能全部保留：breath / hold / grow / dream / trace / anchor / release / forget /
 > restore / purge / I / plan / letter / pulse 与 Dashboard。心潮念只做上述增量，不裁剪。
 

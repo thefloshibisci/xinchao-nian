@@ -8,8 +8,8 @@ DecayEngine / EmbeddingEngine / ImportEngine，把它们注入 tools._runtime �
 web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/tools/<工具>/ 下面）。
 
 关键行为：
-- 启动后暴露 12 个 MCP 工具：breath/hold/grow/trace/anchor/release/
-  pulse/plan/letter_write/letter_read/dream/I；每个入口 ≤ 10 行，只负责转发
+- 启动后暴露 17 个 MCP 工具；breath 同时保留统一参数入口，并提供
+  breath_search / breath_advanced 分拆入口兼容新版客户端；每个入口只负责转发
 - Dashboard / HTTP 路由全部已拆分到 src/web/<域>.py（每个模块 register(mcp)），
   本文件仅在启动时调用 web.register_all(mcp) 装配；共享依赖见 web/_shared.py
 - 仍保留在本文件：进程启动、引擎初始化、GitHub 后台同步循环、Webhook 推送、
@@ -545,6 +545,48 @@ async def breath(
             importance_min=importance_min, tags=tags, catalog=catalog,
         ),
         op="breath",
+        args={
+            "query": query, "max_tokens": max_tokens, "domain": domain,
+            "valence": valence, "arousal": arousal, "max_results": max_results,
+            "importance_min": importance_min, "tags": tags, "catalog": catalog,
+        },
+    )
+
+
+@mcp.tool()
+async def breath_search(
+    query: str,
+    domain: Optional[str] = "",
+    max_results: Optional[int] = 0,
+) -> str:
+    """按关键词/语义检索记忆桶。逐字返回当前桶正文，不调用 LLM 摘要；domain 可按主题域预筛，max_results 默认读取 surfacing 配置。需要更多过滤条件时使用 breath_advanced。"""
+    return await _with_notice(
+        _t_breath.dispatch(query=query, domain=domain, max_results=max_results),
+        op="breath_search",
+        args={"query": query, "domain": domain, "max_results": max_results},
+    )
+
+
+@mcp.tool()
+async def breath_advanced(
+    query: Optional[str] = "",
+    max_tokens: Optional[int] = 0,
+    domain: Optional[str] = "",
+    valence: Optional[float] = -1,
+    arousal: Optional[float] = -1,
+    max_results: Optional[int] = 0,
+    importance_min: Optional[int] = -1,
+    tags: Optional[str] = "",
+    catalog: Optional[bool] = False,
+) -> str:
+    """breath 的完整参数版。支持语义检索、目录模式、domain/tags/情感/重要度过滤与独立 token 预算；统一 breath 入口继续保留以兼容既有客户端。"""
+    return await _with_notice(
+        _t_breath.dispatch(
+            query=query, max_tokens=max_tokens, domain=domain,
+            valence=valence, arousal=arousal, max_results=max_results,
+            importance_min=importance_min, tags=tags, catalog=catalog,
+        ),
+        op="breath_advanced",
         args={
             "query": query, "max_tokens": max_tokens, "domain": domain,
             "valence": valence, "arousal": arousal, "max_results": max_results,
