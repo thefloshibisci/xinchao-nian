@@ -42,6 +42,15 @@ P0luz/Ombre-Brain（原项目, MIT, © P0lar1zzZ）
    - 目的：兼容新版 OB 客户端的工具发现与回退顺序，同时不破坏已有客户端和迁移验收脚本。
    - 不恢复新版已删除的 `source_read`；迁移冷档案继续使用完整 bucket ID 的受控定向检索。
 
+6. **媒体二进制持久化与可验证备份恢复**
+   - 从新版原版 OB 回移植 `MediaStore`：`data_base64`/受限临时路径会在写 bucket 前复制到
+     持久媒体目录，使用 SHA-256 内容寻址、原子写入、批次失败回滚与已有目标哈希校验。
+   - `OMBRE_MEDIA_DIR` 可指定独立持久卷；默认 `<buckets_dir>/_media`。
+     `OMBRE_MEDIA_MAX_BYTES` 控制单项上限，默认 25 MiB；单次仍最多 20 项。
+   - 导出包把媒体放在独立的 `media/` 前缀并纳入完整性 manifest；恢复时校验大小、文件名哈希、
+     `stored=true + sha256` 引用闭包，再按当前环境媒体目录恢复并重写稳定路径。
+   - 旧版仅含历史 `path`、没有二进制成员的包仍可解析，但不会被误报为媒体二进制已恢复。
+
 > OB 原生功能全部保留：breath / hold / grow / dream / trace / anchor / release / forget /
 > restore / purge / I / plan / letter / pulse 与 Dashboard。心潮念只做上述增量，不裁剪。
 

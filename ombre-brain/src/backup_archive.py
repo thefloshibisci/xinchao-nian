@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import sqlite3
+import stat
 import tempfile
 from typing import Any
 import zipfile
@@ -103,14 +104,19 @@ def validate_sqlite_bytes(db_bytes: bytes) -> None:
             pass
 
 
-def _collect_markdown(buckets_dir: str) -> dict[str, bytes]:
+def _collect_markdown(
+    buckets_dir: str, *, media_dir: str | None = None
+) -> dict[str, bytes]:
     base = Path(buckets_dir).resolve()
     if not base.is_dir():
         raise BackupArchiveError(f"buckets_dir not found: {buckets_dir}")
+    media_root = Path(media_dir).resolve() if media_dir else None
 
     files: dict[str, bytes] = {}
     for path in sorted(base.rglob("*.md")):
         resolved = path.resolve()
+        if media_root and (resolved == media_root or media_root in resolved.parents):
+            continue
         if not resolved.is_file() or not resolved.is_relative_to(base):
             raise BackupArchiveError(f"拒绝导出指向记忆目录外的文件: {path}")
         relative = resolved.relative_to(base).as_posix()
@@ -119,6 +125,53 @@ def _collect_markdown(buckets_dir: str) -> dict[str, bytes]:
             files[arc_path] = resolved.read_bytes()
         except OSError as exc:
             raise BackupArchiveError(f"无法读取记忆文件 {relative}: {exc}") from exc
+    return files
+
+
+def _collect_media(media_dir: str) -> dict[str, bytes]:
+    """Collect regular media files under a dedicated portable archive prefix."""
+    base = Path(media_dir).resolve()
+    if not base.exists():
+        return {}
+    if not base.is_dir():
+        raise BackupArchiveError(f"media_dir 不是目录: {media_dir}")
+
+    candidates: list[tuple[Path, str, int]] = []
+    total_bytes = 0
+    for path in sorted(base.rglob("*")):
+        try:
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            raise BackupArchiveError(f"无法检查媒体文件 {path}: {exc}") from exc
+        if stat.S_ISDIR(mode):
+            continue
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise BackupArchiveError(f"拒绝导出符号链接或特殊媒体文件: {path}")
+        resolved = path.resolve()
+        if not resolved.is_relative_to(base):
+            raise BackupArchiveError(f"拒绝导出指向媒体目录外的文件: {path}")
+        size = path.stat().st_size
+        if size > MAX_MEMBER_BYTES:
+            raise BackupArchiveError(f"媒体文件过大: {path.name}")
+        total_bytes += size
+        if total_bytes > MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise BackupArchiveError("媒体文件总量超过 1 GiB 上限")
+        relative = resolved.relative_to(base).as_posix()
+        arc_path = _normalize_member_path(f"media/{relative}")
+        candidates.append((resolved, arc_path, size))
+
+    if len(candidates) > MAX_MEMBERS:
+        raise BackupArchiveError(f"媒体文件项过多（上限 {MAX_MEMBERS}）")
+
+    files: dict[str, bytes] = {}
+    for resolved, arc_path, expected_size in candidates:
+        try:
+            data = resolved.read_bytes()
+        except OSError as exc:
+            raise BackupArchiveError(f"无法读取媒体文件 {resolved.name}: {exc}") from exc
+        if len(data) != expected_size:
+            raise BackupArchiveError(f"媒体文件读取期间发生变化: {resolved.name}")
+        files[arc_path] = data
     return files
 
 
@@ -142,9 +195,12 @@ def build_export_archive(
     buckets_dir: str,
     embedding_db_path: str,
     export_meta: dict[str, Any],
+    media_dir: str | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
     """Build a complete in-memory archive or fail without returning a partial one."""
-    files = _collect_markdown(buckets_dir)
+    effective_media_dir = media_dir or str(Path(buckets_dir) / "_media")
+    files = _collect_markdown(buckets_dir, media_dir=effective_media_dir)
+    files.update(_collect_media(effective_media_dir))
     db_bytes = snapshot_sqlite(embedding_db_path)
     if db_bytes:
         files["embeddings.db"] = db_bytes

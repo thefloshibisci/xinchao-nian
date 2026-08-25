@@ -322,11 +322,24 @@ def load_config(config_path: Optional[str] = None) -> dict:
         except Exception:
             pass
 
+    # 媒体必须和记忆一起落在持久卷；默认使用数据目录下独立的 _media。
+    # OMBRE_MEDIA_DIR 仅在确实挂载了另一块持久盘时覆盖。
+    media_dir = os.environ.get("OMBRE_MEDIA_DIR", "").strip()
+    config["media_dir"] = media_dir or os.path.join(str(config["buckets_dir"]), "_media")
+    try:
+        config["media_max_bytes"] = max(
+            1,
+            int(os.environ.get("OMBRE_MEDIA_MAX_BYTES", 25 * 1024 * 1024)),
+        )
+    except (TypeError, ValueError, OverflowError):
+        config["media_max_bytes"] = 25 * 1024 * 1024
+
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---
     buckets_dir: str = str(config["buckets_dir"])
     for subdir in ["permanent", "dynamic", "archive"]:
         os.makedirs(os.path.join(buckets_dir, subdir), exist_ok=True)
+    os.makedirs(str(config["media_dir"]), exist_ok=True)
 
     return config
 

@@ -27,14 +27,17 @@ migrate_engine.py — 完整记忆包导入引擎
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import frontmatter
@@ -75,6 +78,8 @@ _TYPE_SUBDIR: dict[str, str] = {
 
 # 默认子目录（unknown type 时）
 _DEFAULT_SUBDIR = "dynamic"
+_MEDIA_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_MEDIA_SUFFIX_RE = re.compile(r"^\.[a-zA-Z0-9]{1,10}$")
 
 
 # ============================================================
@@ -91,6 +96,15 @@ class _ParsedBucket:
     bucket_type: str
     domain: list[str]
     created: str
+
+
+@dataclass
+class _ParsedMedia:
+    """One verified media member from the backup archive."""
+    arc_path: str
+    data: bytes
+    sha256: str
+    suffix: str
 
 
 @dataclass
@@ -138,6 +152,7 @@ class MigrateEngine:
 
         # ---- 解析阶段产物 ----
         self._parsed_buckets: list[_ParsedBucket] = []
+        self._parsed_media: dict[str, list[_ParsedMedia]] = {}
         self._conflicts: list[ConflictInfo] = []
         self._import_model: str = ""
         self._import_model_dim: int = 0
@@ -202,6 +217,7 @@ class MigrateEngine:
         return {
             "phase": self._phase,
             "total_buckets": len(self._parsed_buckets),
+            "total_media": sum(len(items) for items in self._parsed_media.values()),
             "conflicts_count": len(self._conflicts),
             "conflicts": [
                 {
@@ -259,6 +275,7 @@ class MigrateEngine:
         # 重置所有状态
         self._phase = PHASE_IDLE
         self._parsed_buckets = []
+        self._parsed_media = {}
         self._conflicts = []
         self._import_model = ""
         self._import_model_dim = 0
@@ -289,6 +306,7 @@ class MigrateEngine:
             return {"ok": False, "error": self._error_message}
 
         self._parsed_buckets = parsed["buckets"]
+        self._parsed_media = parsed["media"]
         self._import_model = parsed["import_model"]
         self._import_model_dim = parsed["import_model_dim"]
         self._import_backend = parsed["import_backend"]
@@ -315,6 +333,7 @@ class MigrateEngine:
     def _parse_zip_sync(self, zip_bytes: bytes) -> dict:
         """同步解析 zip（在 to_thread 中执行）。"""
         buckets: list[_ParsedBucket] = []
+        media: dict[str, list[_ParsedMedia]] = {}
         import_model = ""
         import_model_dim = 0
         import_backend = ""
@@ -324,6 +343,35 @@ class MigrateEngine:
         package = read_backup_archive(zip_bytes)
         files: dict[str, bytes] = package["files"]
         names = set(files)
+
+        # 0) 先校验媒体成员。文件名采用内容哈希时必须和真实字节一致；
+        # 真正写入目标卷发生在 apply，parse 阶段只做有界预检。
+        max_media_bytes = max(1, int(self._config.get("media_max_bytes") or 25 * 1024 * 1024))
+        for arc_path in sorted(names):
+            if not arc_path.startswith("media/"):
+                continue
+            parts = arc_path.split("/")
+            if len(parts) < 3 or not parts[-1]:
+                raise BackupArchiveError(f"媒体成员路径格式错误: {arc_path}")
+            raw = files[arc_path]
+            if len(raw) > max_media_bytes:
+                raise BackupArchiveError(
+                    f"媒体成员超过单项上限 {max_media_bytes} 字节: {arc_path}"
+                )
+            digest = hashlib.sha256(raw).hexdigest()
+            filename = parts[-1]
+            stem = Path(filename).stem.lower()
+            if _MEDIA_DIGEST_RE.fullmatch(stem) and stem != digest:
+                raise BackupArchiveError(f"媒体文件名哈希与内容不一致: {arc_path}")
+            suffix = Path(filename).suffix.lower()
+            if not _MEDIA_SUFFIX_RE.fullmatch(suffix):
+                suffix = ".bin"
+            media.setdefault(digest, []).append(_ParsedMedia(
+                arc_path=arc_path,
+                data=raw,
+                sha256=digest,
+                suffix=suffix,
+            ))
 
         # 1) 读取 export_meta.json → 获取 embedding 模型信息
         if "export_meta.json" in names:
@@ -376,6 +424,22 @@ class MigrateEngine:
                     domain = [domain]
                 elif not isinstance(domain, list):
                     domain = []
+                media_meta = meta.get("media") or []
+                if not isinstance(media_meta, list):
+                    media_meta = [media_meta]
+                for item in media_meta:
+                    if not isinstance(item, dict) or item.get("stored") is not True:
+                        continue
+                    digest = str(item.get("sha256") or "").strip().lower()
+                    if not _MEDIA_DIGEST_RE.fullmatch(digest):
+                        raise BackupArchiveError(
+                            f"{arc_path} 的 stored media 缺少有效 sha256"
+                        )
+                    if digest not in media:
+                        raise BackupArchiveError(
+                            f"{arc_path} 引用的媒体未包含在备份中: {digest[:12]}"
+                        )
+
                 buckets.append(_ParsedBucket(
                     bucket_id=bucket_id,
                     arc_path=arc_path,
@@ -392,6 +456,7 @@ class MigrateEngine:
 
         return {
             "buckets": buckets,
+            "media": media,
             "import_model": import_model,
             "import_model_dim": import_model_dim,
             "import_backend": import_backend,
@@ -520,6 +585,116 @@ class MigrateEngine:
             self._error_message = str(e)
             logger.error(f"[migrate] apply failed: {e}", exc_info=True)
 
+    @staticmethod
+    def _media_digest_from_entry(entry: dict[str, Any]) -> str:
+        digest = str(entry.get("sha256") or "").strip().lower()
+        if _MEDIA_DIGEST_RE.fullmatch(digest):
+            return digest
+        raw_path = str(entry.get("path") or "").replace("\\", "/")
+        stem = Path(raw_path).stem.lower()
+        return stem if _MEDIA_DIGEST_RE.fullmatch(stem) else ""
+
+    @staticmethod
+    def _write_media_atomically(target: Path, data: bytes, digest: str) -> bool:
+        """Write one content-addressed media file; return True only when created."""
+        if target.exists() or target.is_symlink():
+            try:
+                mode = target.lstat().st_mode
+            except OSError as exc:
+                raise BackupArchiveError(f"无法检查已有媒体文件: {target}") from exc
+            if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+                raise BackupArchiveError(f"媒体目标不是普通文件: {target}")
+            try:
+                existing = target.read_bytes()
+            except OSError as exc:
+                raise BackupArchiveError(f"无法读取已有媒体文件: {target}") from exc
+            if hashlib.sha256(existing).hexdigest() != digest:
+                raise BackupArchiveError(f"媒体目标发生哈希冲突: {target}")
+            return False
+
+        fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            return True
+        finally:
+            try:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            except OSError:
+                pass
+
+    def _restore_bucket_media(
+        self, meta: dict[str, Any], target_id: str, buckets_dir: str
+    ) -> list[Path]:
+        """Restore verified media for one imported bucket and rewrite stable paths."""
+        media_meta = meta.get("media") or []
+        if not self._parsed_media or not media_meta:
+            return []
+        if not isinstance(media_meta, list):
+            media_meta = [media_meta]
+
+        media_root = Path(
+            str(self._config.get("media_dir") or (Path(buckets_dir) / "_media"))
+        ).resolve()
+        if media_root.exists() and not media_root.is_dir():
+            raise BackupArchiveError(f"media_dir 不是目录: {media_root}")
+        media_root.mkdir(parents=True, exist_ok=True)
+        safe_bucket = re.sub(r"[^a-zA-Z0-9_.-]", "_", target_id)[:128] or "bucket"
+        target_dir = (media_root / safe_bucket).resolve()
+        if media_root not in target_dir.parents:
+            raise BackupArchiveError("媒体恢复目标目录越界")
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        bucket_root = Path(buckets_dir).resolve()
+        created: list[Path] = []
+        rewritten: list[Any] = []
+        try:
+            for raw_item in media_meta:
+                if not isinstance(raw_item, dict):
+                    rewritten.append(raw_item)
+                    continue
+                entry = dict(raw_item)
+                digest = self._media_digest_from_entry(entry)
+                candidates = self._parsed_media.get(digest) if digest else None
+                if not candidates:
+                    rewritten.append(entry)
+                    continue
+                preferred_suffix = Path(
+                    str(entry.get("path") or "").replace("\\", "/")
+                ).suffix.lower()
+                candidate = next(
+                    (item for item in candidates if item.suffix == preferred_suffix),
+                    candidates[0],
+                )
+                target = target_dir / f"{digest}{candidate.suffix}"
+                if self._write_media_atomically(target, candidate.data, digest):
+                    created.append(target)
+                try:
+                    stable_path = target.relative_to(bucket_root).as_posix()
+                except ValueError:
+                    stable_path = str(target)
+                entry.update({
+                    "path": stable_path,
+                    "sha256": digest,
+                    "size": len(candidate.data),
+                    "stored": True,
+                })
+                rewritten.append(entry)
+        except Exception:
+            for path in reversed(created):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise
+
+        meta["media"] = rewritten
+        return created
+
     def _write_bucket_file(
         self, pb: _ParsedBucket, target_id: str, buckets_dir: str
     ) -> str:
@@ -558,16 +733,26 @@ class MigrateEngine:
         safe_name = sanitize_name(str(meta.get("name") or pb.name or target_id))[:40]
         target_path = str(safe_path(target_dir, f"{safe_name}_{safe_id}.md"))
 
-        # 重新序列化 frontmatter + 正文
-        post = frontmatter.Post(content, **meta)
-        rendered = frontmatter.dumps(post)
+        # 媒体和 Markdown 作为一个桶级事务处理：媒体先原子落盘；
+        # Markdown 失败时只清理本次新建的媒体，不删除此前已有的内容寻址文件。
         temp_path = f"{target_path}.{uuid.uuid4().hex}.tmp"
+        created_media: list[Path] = []
         try:
+            created_media = self._restore_bucket_media(meta, target_id, buckets_dir)
+            post = frontmatter.Post(content, **meta)
+            rendered = frontmatter.dumps(post)
             with open(temp_path, "w", encoding="utf-8") as f:
                 f.write(rendered)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp_path, target_path)
+        except Exception:
+            for media_path in reversed(created_media):
+                try:
+                    media_path.unlink()
+                except OSError:
+                    pass
+            raise
         finally:
             try:
                 if os.path.exists(temp_path):

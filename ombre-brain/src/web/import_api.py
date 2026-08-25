@@ -568,6 +568,7 @@ def register(mcp) -> None:
                 buckets_dir,
                 emb_path,
                 meta,
+                str(sh.config.get("media_dir") or os.path.join(buckets_dir, "_media")),
             )
         except BackupArchiveError as e:
             return JSONResponse({"error": f"export failed: {e}"}, status_code=500)
