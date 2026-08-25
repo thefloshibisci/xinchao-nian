@@ -113,11 +113,258 @@ def test_manifest_schema_and_apply_flag_are_explicit(tmp_path: Path) -> None:
         rm.load_manifest(insecure)
 
     dry_args = rm.parse_args(["--manifest", str(insecure), "--buckets-dir", str(tmp_path)])
+    verify_args = rm.parse_args(
+        ["--manifest", str(insecure), "--buckets-dir", str(tmp_path), "--verify-downloads"]
+    )
     apply_args = rm.parse_args(
         ["--manifest", str(insecure), "--buckets-dir", str(tmp_path), "--apply"]
     )
     assert dry_args.apply is False
+    assert dry_args.verify_downloads is False
+    assert verify_args.apply is False
+    assert verify_args.verify_downloads is True
     assert apply_args.apply is True
+    assert apply_args.verify_downloads is False
+    with pytest.raises(SystemExit):
+        rm.parse_args(
+            [
+                "--manifest",
+                str(insecure),
+                "--buckets-dir",
+                str(tmp_path),
+                "--verify-downloads",
+                "--apply",
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_and_verify_downloads_are_mutually_exclusive_at_api_boundary(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(rm.RehydrationError, match="mutually exclusive"):
+        await rm.rehydrate_media(
+            tmp_path / "not-read.json",
+            tmp_path / "not-read-vault",
+            apply=True,
+            verify_downloads=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_verify_downloads_is_ephemeral_deduplicated_and_never_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = tmp_path / "vault"
+    first_bucket = _seed_bucket(vault, "bucket-verify-a")
+    second_bucket = _seed_bucket(vault, "bucket-verify-b")
+    originals = {first_bucket: first_bucket.read_bytes(), second_bucket: second_bucket.read_bytes()}
+    data = b"verified-once"
+    source_url = "https://media.example.test/shared.png?token=do-not-log"
+    manifest = _write_manifest(
+        tmp_path / "manifest.json",
+        [
+            _item("bucket-verify-a", source_url, data, type="image/png"),
+            _item("bucket-verify-b", source_url, data, type="image/png"),
+        ],
+    )
+    requests = 0
+    temporary_directories: list[Path] = []
+    original_verify_all = rm._verify_downloads_all
+
+    def capture_download_directory(items, directory, **kwargs):
+        temporary_directories.append(directory)
+        assert directory.exists()
+        return original_verify_all(items, directory, **kwargs)
+
+    class ForbiddenMediaStore:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise AssertionError("verify-downloads must not instantiate MediaStore")
+
+    monkeypatch.setattr(rm, "_verify_downloads_all", capture_download_directory)
+    monkeypatch.setattr(rm, "MediaStore", ForbiddenMediaStore)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            200,
+            content=data,
+            headers={"content-type": "image/png", "content-length": str(len(data))},
+        )
+
+    client = _client(handler)
+    try:
+        report = await rm.rehydrate_media(
+            manifest,
+            vault,
+            verify_downloads=True,
+            client=client,
+            resolver=PUBLIC_RESOLVER,
+        )
+    finally:
+        client.close()
+
+    assert requests == 1
+    assert report["mode"] == "verify-downloads"
+    assert report["network_accessed"] is True
+    assert report["counts"] == {
+        "manifest": 2,
+        "unique_sources": 1,
+        "verified_sources": 1,
+        "failed_sources": 0,
+        "verified": 2,
+        "failed": 0,
+        "downloaded_bytes": len(data),
+    }
+    assert [source["status"] for source in report["sources"]] == ["verified"]
+    assert [item["status"] for item in report["items"]] == ["verified", "verified"]
+    assert all(item["sha256"] == hashlib.sha256(data).hexdigest() for item in report["items"])
+    assert all(item["mime_type"] == "image/png" for item in report["items"])
+    assert all(path.read_bytes() == original for path, original in originals.items())
+    assert not (vault / "_media").exists()
+    assert len(temporary_directories) == 1
+    assert not temporary_directories[0].exists()
+    serialized = json.dumps(report)
+    assert source_url not in serialized
+    assert "token=do-not-log" not in serialized
+    assert "https://" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_verify_download_failure_is_reported_after_other_sources_are_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = tmp_path / "vault"
+    bucket = _seed_bucket(vault, "bucket-verify-failure")
+    before = bucket.read_bytes()
+    good_data = b"still-verified"
+    manifest = _write_manifest(
+        tmp_path / "manifest.json",
+        [
+            _item("bucket-verify-failure", "https://media.example.test/missing.png"),
+            _item(
+                "bucket-verify-failure",
+                "https://media.example.test/good.png",
+                good_data,
+            ),
+        ],
+    )
+    temporary_directories: list[Path] = []
+    original_verify_all = rm._verify_downloads_all
+
+    def capture_download_directory(items, directory, **kwargs):
+        temporary_directories.append(directory)
+        assert directory.exists()
+        return original_verify_all(items, directory, **kwargs)
+
+    monkeypatch.setattr(rm, "_verify_downloads_all", capture_download_directory)
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path == "/missing.png":
+            return httpx.Response(404, content=b"missing")
+        return httpx.Response(200, content=good_data)
+
+    client = _client(handler)
+    try:
+        report = await rm.rehydrate_media(
+            manifest,
+            vault,
+            verify_downloads=True,
+            client=client,
+            resolver=PUBLIC_RESOLVER,
+        )
+    finally:
+        client.close()
+
+    assert requested_paths == ["/missing.png", "/good.png"]
+    assert report["counts"] == {
+        "manifest": 2,
+        "unique_sources": 2,
+        "verified_sources": 1,
+        "failed_sources": 1,
+        "verified": 1,
+        "failed": 1,
+        "downloaded_bytes": len(good_data),
+    }
+    assert [source["status"] for source in report["sources"]] == ["failed", "verified"]
+    assert [item["status"] for item in report["items"]] == ["failed", "verified"]
+    assert "HTTP 404" in report["sources"][0]["error"]
+    assert bucket.read_bytes() == before
+    assert not (vault / "_media").exists()
+    assert len(temporary_directories) == 1
+    assert not temporary_directories[0].exists()
+    serialized = json.dumps(report)
+    assert "https://" not in serialized
+    assert "media.example.test" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_verify_transport_failure_reports_only_exception_class_and_source_ref(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    bucket = _seed_bucket(vault, "bucket-verify-timeout")
+    source_url = "https://private.example.test/image.png?token=must-not-leak"
+    manifest = _write_manifest(
+        tmp_path / "manifest.json",
+        [_item("bucket-verify-timeout", source_url)],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(f"secret transport detail: {request.url}", request=request)
+
+    client = _client(handler)
+    try:
+        report = await rm.rehydrate_media(
+            manifest,
+            vault,
+            verify_downloads=True,
+            client=client,
+            resolver=PUBLIC_RESOLVER,
+        )
+    finally:
+        client.close()
+
+    error = report["sources"][0]["error"]
+    assert "ReadTimeout" in error
+    assert report["sources"][0]["source_ref"] in error
+    assert source_url not in error
+    assert "private.example.test" not in error
+    assert "token=must-not-leak" not in error
+    assert bucket.exists()
+    assert not (vault / "_media").exists()
+
+
+def test_main_returns_nonzero_with_complete_report_for_verification_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def fake_rehydrate(*_args, **_kwargs):
+        return {
+            "format": rm.MANIFEST_FORMAT,
+            "mode": "verify-downloads",
+            "network_accessed": True,
+            "sources": [{"source_ref": "url-sha256:fixture", "status": "failed"}],
+            "items": [],
+            "counts": {"failed_sources": 1},
+        }
+
+    monkeypatch.setattr(rm, "rehydrate_media", fake_rehydrate)
+    exit_code = rm.main(
+        [
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--buckets-dir",
+            str(tmp_path / "vault"),
+            "--verify-downloads",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert payload["counts"]["failed_sources"] == 1
 
 
 @pytest.mark.asyncio

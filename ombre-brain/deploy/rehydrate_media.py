@@ -2,8 +2,9 @@
 """Safely attach explicitly listed remote media to existing Ombre Brain buckets.
 
 The tool never scans bucket content for URLs.  Its input is a user-authored JSON
-manifest, and its default mode is a network-free dry run.  ``--apply`` is
-required before any DNS lookup, HTTP request, media write, or Markdown update.
+manifest, and its default mode is a network-free dry run.  ``--verify-downloads``
+performs an ephemeral network preflight without persistent writes.  ``--apply``
+is required before any media write or Markdown update.
 
 Manifest example::
 
@@ -439,7 +440,10 @@ def _download_one(
                 target.unlink()
             except OSError:
                 pass
-            raise RehydrationError(f"download failed ({item.source_ref})") from exc
+            failure_kind = type(exc).__name__
+            raise RehydrationError(
+                f"download failed: {failure_kind} ({item.source_ref})"
+            ) from exc
 
         actual_sha256 = digest.hexdigest()
         if item.expected_size is not None and size != item.expected_size:
@@ -488,6 +492,50 @@ def _download_all(
             )
         )
     return downloaded
+
+
+def _verify_downloads_all(
+    items: list[ManifestItem],
+    directory: Path,
+    *,
+    client: httpx.Client,
+    resolver: Resolver,
+    max_item_bytes: int,
+    max_total_bytes: int,
+) -> tuple[list[DownloadedItem], list[tuple[ManifestItem, str]]]:
+    """Attempt every unique verification source while keeping failures sanitized."""
+    downloaded: list[DownloadedItem] = []
+    failures: list[tuple[ManifestItem, str]] = []
+    total = 0
+    for index, item in enumerate(items):
+        suffix = Path(item.filename).suffix[:12]
+        target = directory / f"{index:05d}{suffix}"
+        try:
+            digest, size, mime_type = _download_one(
+                item,
+                target,
+                client=client,
+                resolver=resolver,
+                max_item_bytes=max_item_bytes,
+            )
+        except RehydrationError as exc:
+            failures.append((item, str(exc)))
+            continue
+        total += size
+        if total > max_total_bytes:
+            target.unlink(missing_ok=True)
+            raise RehydrationError("downloaded media exceeds the batch byte limit")
+        downloaded.append(
+            DownloadedItem(
+                ordinal=index,
+                item=item,
+                path=target,
+                sha256=digest,
+                size=size,
+                mime_type=mime_type,
+            )
+        )
+    return downloaded, failures
 
 
 def _report_entry(item: ManifestItem, status: str, **extra: Any) -> dict[str, Any]:
@@ -643,6 +691,7 @@ async def rehydrate_media(
     *,
     media_dir: Path | None = None,
     apply: bool = False,
+    verify_downloads: bool = False,
     max_items: int = DEFAULT_MAX_ITEMS,
     max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
@@ -650,12 +699,17 @@ async def rehydrate_media(
     client: httpx.Client | None = None,
     resolver: Resolver = _resolve_public_addresses,
 ) -> dict[str, Any]:
-    """Validate or apply one explicit media manifest.
+    """Validate, preflight, or apply one explicit media manifest.
 
-    Dry-run performs no DNS or HTTP work.  Apply downloads every item before the
-    first persistent write.  Any download/persistence/serialization failure
-    leaves Markdown unchanged and removes media files created by this call.
+    Dry-run performs no DNS or HTTP work.  Verify-downloads fetches each unique
+    source once into an automatically removed temporary directory and never
+    creates a persistent media store or rewrites bucket Markdown.  Apply
+    downloads every item before the first persistent write.  Any
+    download/persistence/serialization failure leaves Markdown unchanged and
+    removes media files created by this call.
     """
+    if apply and verify_downloads:
+        raise RehydrationError("apply and verify_downloads are mutually exclusive")
     items = load_manifest(
         manifest_path,
         max_items=max_items,
@@ -671,10 +725,11 @@ async def rehydrate_media(
     snapshots = {bucket_id: _read_bucket(index[bucket_id], bucket_id) for bucket_id in requested_ids}
     effective_media_dir = (media_dir or (vault / "_media")).resolve()
     dry_report = _dry_run_report(items, snapshots, vault, effective_media_dir)
-    if not apply:
+    if not apply and not verify_downloads:
         return dry_report
+    requested_mode = "apply" if apply else "verify-downloads"
     if not items:
-        return {**dry_report, "mode": "apply", "network_accessed": False}
+        return {**dry_report, "mode": requested_mode, "network_accessed": False}
 
     own_client = client is None
     http_client = client or httpx.Client(
@@ -685,6 +740,82 @@ async def rehydrate_media(
     )
     try:
         with tempfile.TemporaryDirectory(prefix="ombre-media-rehydrate-") as temporary:
+            if verify_downloads:
+                unique_by_url: dict[str, ManifestItem] = {}
+                for item in items:
+                    unique_by_url.setdefault(item.source_url, item)
+                download_items = list(unique_by_url.values())
+                downloaded, failures = await asyncio.to_thread(
+                    _verify_downloads_all,
+                    download_items,
+                    Path(temporary),
+                    client=http_client,
+                    resolver=resolver,
+                    max_item_bytes=max_item_bytes,
+                    max_total_bytes=max_total_bytes,
+                )
+                downloaded_by_url = {entry.item.source_url: entry for entry in downloaded}
+                failures_by_url = {item.source_url: error for item, error in failures}
+                source_results: list[dict[str, Any]] = []
+                for item in download_items:
+                    entry = downloaded_by_url.get(item.source_url)
+                    if entry is not None:
+                        source_results.append(
+                            {
+                                "source_ref": item.source_ref,
+                                "status": "verified",
+                                "sha256": entry.sha256,
+                                "size": entry.size,
+                                "mime_type": entry.mime_type,
+                            }
+                        )
+                    else:
+                        source_results.append(
+                            {
+                                "source_ref": item.source_ref,
+                                "status": "failed",
+                                "error": failures_by_url[item.source_url],
+                            }
+                        )
+
+                report_items: list[dict[str, Any]] = []
+                for item in items:
+                    entry = downloaded_by_url.get(item.source_url)
+                    if entry is not None:
+                        report_items.append(
+                            _report_entry(
+                                item,
+                                "verified",
+                                sha256=entry.sha256,
+                                size=entry.size,
+                                mime_type=entry.mime_type,
+                            )
+                        )
+                    else:
+                        report_items.append(
+                            _report_entry(
+                                item,
+                                "failed",
+                                error=failures_by_url[item.source_url],
+                            )
+                        )
+                return {
+                    "format": MANIFEST_FORMAT,
+                    "mode": "verify-downloads",
+                    "network_accessed": True,
+                    "sources": source_results,
+                    "items": report_items,
+                    "counts": {
+                        "manifest": len(items),
+                        "unique_sources": len(download_items),
+                        "verified_sources": len(downloaded),
+                        "failed_sources": len(failures),
+                        "verified": sum(item["status"] == "verified" for item in report_items),
+                        "failed": sum(item["status"] == "failed" for item in report_items),
+                        "downloaded_bytes": sum(entry.size for entry in downloaded),
+                    },
+                }
+
             downloaded = await asyncio.to_thread(
                 _download_all,
                 items,
@@ -694,7 +825,6 @@ async def rehydrate_media(
                 max_item_bytes=max_item_bytes,
                 max_total_bytes=max_total_bytes,
             )
-
             selected: dict[str, list[DownloadedItem]] = {}
             status_by_ordinal: dict[int, tuple[str, str]] = {}
             verified_by_bucket = {
@@ -848,10 +978,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--buckets-dir", type=Path, required=True)
     parser.add_argument("--media-dir", type=Path)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--verify-downloads",
+        action="store_true",
+        help="download each unique source to temporary storage, verify it, then delete it",
+    )
+    mode.add_argument(
         "--apply",
         action="store_true",
-        help="perform DNS/HTTP and writes; omitted means network-free dry-run",
+        help="perform DNS/HTTP and persistent writes; omitted means network-free dry-run",
     )
     parser.add_argument("--max-items", type=int, default=DEFAULT_MAX_ITEMS)
     parser.add_argument("--max-item-bytes", type=int, default=DEFAULT_MAX_ITEM_BYTES)
@@ -874,6 +1010,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.buckets_dir,
                 media_dir=args.media_dir,
                 apply=args.apply,
+                verify_downloads=args.verify_downloads,
                 max_items=args.max_items,
                 max_item_bytes=args.max_item_bytes,
                 max_total_bytes=args.max_total_bytes,
@@ -883,8 +1020,19 @@ def main(argv: list[str] | None = None) -> int:
     except RehydrationError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
-    print(json.dumps({"ok": True, **report}, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0
+    verification_failed = (
+        report.get("mode") == "verify-downloads"
+        and report.get("counts", {}).get("failed_sources", 0) > 0
+    )
+    print(
+        json.dumps(
+            {"ok": not verification_failed, **report},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 2 if verification_failed else 0
 
 
 if __name__ == "__main__":
