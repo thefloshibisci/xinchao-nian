@@ -15,6 +15,7 @@ import { handleMcpMessage } from './mcp-protocol.js';
 import { OAuthProvider } from './oauth-provider.js';
 import { recordHandoffNote } from './handoff-notes.js';
 import { newContinuityState, recordRecentTurn, renderRecentTurns } from './recent-continuity.js';
+import { parseBearerAuthorization, validateGatewayContinuityRequest } from './http-contract.js';
 import { DashboardAuth } from './dashboard-auth.js';
 import { buildConnectionManifest, buildDashboardSnapshot } from './dashboard-projection.js';
 import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue } from './bridge-queue.js';
@@ -1344,6 +1345,18 @@ const server = createServer(async (request, response) => {
       });
     }
     if (!authorized(request)) return send(response, 401, { error: 'unauthorized' });
+
+
+
+
+    if (request.method === 'POST' && url.pathname === '/v1/continuity/sync') {
+      if (!config.continuity.enabled) return send(response, 503, { error: 'recent continuity disabled' });
+      const payload = await body(request);
+      const normalized = validateGatewayContinuityRequest(payload, {
+        defaultLimit: config.continuity.maxContextTurns,
+      });
+      return send(response, 200, await synchronizeRecentContinuity(normalized));
+    }
 
 
 

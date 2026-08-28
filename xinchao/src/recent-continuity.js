@@ -53,7 +53,7 @@ export function recordRecentTurn(input, {
 } = {}) {
   const state = pruneRecentContinuity(input, now);
   const profile = profileKey(profileId);
-  const cleanSession = clean(sessionId, 120);
+  const cleanSession = clean(sessionId, 160);
   const cleanTurn = clean(turnId, 160);
   const cleanText = clean(text, MAX_TEXT_CHARS);
   if (!cleanSession) throw new Error('session_id 是必填项');
@@ -87,8 +87,8 @@ export function recentTurns(input, {
   limit = 8, includeAllSessions = true, now = new Date(),
 } = {}) {
   const profile = profileKey(profileId);
-  const cleanSession = clean(sessionId, 120);
-  const excludedSession = clean(excludeSessionId, 120);
+  const cleanSession = clean(sessionId, 160);
+  const excludedSession = clean(excludeSessionId, 160);
   const rows = (input?.profiles?.[profile] ?? []).filter((item) => (
     Date.parse(item?.expiresAt ?? '') > new Date(now).getTime()
     && (!excludedSession || item.sessionId !== excludedSession)
