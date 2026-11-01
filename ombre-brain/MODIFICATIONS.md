@@ -11,7 +11,6 @@ P0luz/Ombre-Brain（原项目, MIT, © P0lar1zzZ）
 - 原项目：https://github.com/P0luz/Ombre-Brain  （MIT，见 `LICENSE.P0luz-MIT`）
 - 二改仓库：CyberSealNull（fork of P0luz，见 `LICENSE.CyberSealNull` / `NOTICE.CyberSealNull.md`；
   其新增内容仅限个人 / 学习 / 非商业，商用需该 fork 维护者书面许可）
-- 本版本基线：`VERSION` = 2.6.5
 
 ## 心潮念在此基础上的改动
 
@@ -24,6 +23,37 @@ P0luz/Ombre-Brain（原项目, MIT, © P0lar1zzZ）
 2. **压缩/脱水模型默认**（部署配置层，非源码逻辑）
    - 压缩模型从 GLM-Z1 换成 DeepSeek-V3（11.5s → ~1.0s）。通过 config / 环境变量配置，
      不改源码。
+
+3. **bucket-map（记忆星图数据源）**
+   - `src/web/buckets.py`：新增 `GET /api/bucket-map`——sidecar 专用（与
+     `/api/bucket-preview` 同一 `OMBRE_MCP_SERVICE_TOKEN` Bearer 边界，不收浏览器
+     cookie）的结构化星表：仅逐桶元数据（id/name/type/domain/tags/情感/重要度/
+     score 等），**不含正文、不含 content_preview / why_remembered**，按 score
+     降序、封顶 800 条。
+   - 目的：pulse 是人类可读摘要，桶多时不含逐桶行，上层"心潮"解析不出星图；
+     星图需要结构化行。additive，不改任何既有路由与工具。
+
+4. **MCP 工具注解（annotations）**
+   - `src/server.py`：12 个 MCP 工具统一声明 `ToolAnnotations`。只有 `breath`、`pulse`
+     标 `readOnlyHint=True`（breath 命中只更新激活计数，不改正文/元数据）；`purge`
+     标 `destructiveHint=True`；其余写工具 readOnly=False。
+   - 目的：claude.ai 等客户端只对 readOnly 工具开放「总是允许」，没有注解时所有工具
+     都只能逐次批准。心潮念 `relabelOb` 原样透传 annotations，上层无需改动。additive。
+
+5. **grow 重复提交去重（幂等重试）**
+   - `src/tools/grow/__init__.py`：按 (content/items, auto, source) 指纹记录最近一次
+     **成功**结果到 `<buckets_dir>/.companion/grow-recent.json`；窗口内
+     （`OMBRE_GROW_DEDUPE_SECONDS`，默认 6h，0=关闭）同样内容再次 grow 直接返回上次结果、
+     不再写桶。失败结果不缓存，照常可重试；账本 IO 出错静默放行。
+   - 目的：客户端（claude.ai 连接器）等不到 grow 返回先超时、服务端其实已写入，上层 AI
+     误以为失败重试，同一段日记被反复拆成新桶。additive，不改任何既有写入路径的行为。
+
+6. **时间带时区（4.2.1）**
+   - `src/utils.py`：`now_iso()` 写入时带本地时区偏移（`…+00:00`），原先是不带时区的本地时间。
+     `parse_iso_datetime` 本来就会把带偏移的时间归一成本地时间，进程内比较行为不变。
+   - `frontend/dashboard.html`：新增 `parseBucketDate()`，不带时区的旧时间按 UTC 读（容器本地时间
+     就是 UTC），「多久以前」和 45 天未活跃判断都改用它。
+   - 目的：Dashboard 在 UTC+8 浏览器里把记忆时间多算 8 小时、日期落到前一天（用户反馈）。
 
 > OB 原生功能全部保留：breath / hold / grow / dream / trace / anchor / release / forget /
 > restore / purge / I / plan / letter / pulse 与 Dashboard。心潮念只做上述增量，不裁剪。

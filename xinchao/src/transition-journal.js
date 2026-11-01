@@ -1,3 +1,6 @@
+// 【引擎】变化日志：每次结算前后驱力怎么变的，留一份摘要给觉察和网页看。
+// 代码地图见 src/README.md。
+
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -8,6 +11,7 @@ const SAFE_DETAIL_KEYS = new Set([
   'changed',
   'daytimeSent',
   'delivered',
+  'domains',
   'dreamCreated',
   'duplicate',
   'estimatedTokens',

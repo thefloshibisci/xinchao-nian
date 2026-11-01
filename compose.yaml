@@ -12,7 +12,12 @@
 
 services:
   ombre-brain:
-    build: ./ombre-brain
+    build:
+      context: ./ombre-brain
+      args:
+        # 国内 VPS 直连官方 PyPI 常卡死；在 .env 里填 PIP_INDEX_URL 即可走镜像（Dockerfile 已支持）
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
     image: xinchao-nian/ombre-brain:local
     container_name: ombre-brain
     restart: unless-stopped
@@ -29,6 +34,10 @@ services:
       - OMBRE_EMBED_MODEL=${OMBRE_EMBED_MODEL:-}
       - OMBRE_DASHBOARD_PASSWORD=${OMBRE_DASHBOARD_PASSWORD}
       - OMBRE_MCP_REQUIRE_AUTH=true
+      # OB 3.6+：/mcp 的 Bearer 走 mcp_auth_mode，默认 oauth 会把静态密钥全部 401；hybrid 同时接受静态密钥，
+      # 静态密钥读 OMBRE_MCP_TOKEN（3.6 改名）。旧版 OB 不认这两个变量，多传无害。
+      - OMBRE_MCP_AUTH_MODE=${OMBRE_MCP_AUTH_MODE:-hybrid}
+      - OMBRE_MCP_TOKEN=${OMBRE_MCP_TOKEN:-${OMBRE_MCP_SERVICE_TOKEN:-}}
       - OMBRE_MCP_SERVICE_TOKEN=${OMBRE_MCP_SERVICE_TOKEN:-}
       - OMBRE_TRUSTED_PROXY_CIDRS=${OMBRE_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128}
       # sidecar：OB 在内部网络里读心潮的"此刻状态"
@@ -44,6 +53,10 @@ services:
       - xinchao-nian
 
   dynamic-mind:
+    # 源码在 build 时打进镜像，所以改了 xinchao/src 下的代码要 `docker compose up -d --build`
+    # 才生效，光 restart 不行。如果你想改代码只 restart 就生效（省掉每次重建），可以自行把源码
+    # 目录挂进容器（例如在下面 volumes 里加 `- ./xinchao/src:/app/src:ro`），代价是容器不再自成
+    # 一体、依赖宿主目录。默认不挂，把这个取舍留给部署者按需决定。
     build: ./xinchao
     image: xinchao-nian/dynamic-mind:local
     container_name: ombre-dynamic-mind
@@ -65,6 +78,8 @@ services:
       # 用镜像内 /app/state 的 node 所有权初始化，一键部署不需手动 chown。
       - xinchao-state:/app/state
       - ombre-buckets:/ombre-buckets:ro
+      # 4.0：把配置目录挂进来，改 xinchao/configs/ 里的 interaction-rules.json、attention-rules.json 一分钟内生效，不用重建
+      - ./xinchao/configs:/app/configs:ro
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

@@ -1,7 +1,14 @@
+// 【服务底座】HTTP 服务入口：所有接口的路由、定时结算、把上面各块接到一起。
+// 代码地图见 src/README.md。
+
 import { createServer } from 'node:http';
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { loadConfig, validateConfig } from './config.js';
-import { INTERACTION_TYPES, applyDriveFeedback, applyMemoryResonance, applyOmbreHeartbeat, applyOutputReflux, applyLongingNudge, barkAllowed, breathDreamContext, contactIdleAllowed, computeLonging, daytimeEmergenceAllowed, dreamAllowed, newState, pickIntent, proactiveBarkAllowed, recordBark, recordDaytimeEmergence, recordDream, scheduleDaytimeEmergence, settleAndApplyConversationEvent, settleState, topDrives } from './engine.js';
+import { emotionCoords, emotionSummary, stampEmotionArgs } from './emotion.js';
+import { recordSurfacing, resolveAwareness, scanAwareness, awarenessSummary } from './awareness.js';
+import { detectSelfSignals, renderNowLine, SELF_REPORT_TYPES } from './self-signals.js';
+import { BlackBox, renderBoxList } from './black-box.js';
+import { INTERACTION_TYPES, driveTrend, applyDriveFeedback, applySatisfaction, applyMemoryResonance, applyOmbreHeartbeat, applyOutputReflux, applyLongingNudge, barkAllowed, breathDreamContext, contactIdleAllowed, computeLonging, daytimeEmergenceAllowed, dreamAllowed, newState, pickIntent, proactiveBarkAllowed, recordBark, recordDaytimeEmergence, recordDream, scheduleDaytimeEmergence, settleAndApplyConversationEvent, settleState, topDrives, computeAnticipation, localDayAndHour, applySurfacedThought, surfacedDriveKey, recentSurfacedBucketIds, recordSurfacedBuckets } from './engine.js';
 import { buildInteractionBridgeMessage } from './interaction-messages.js';
 import { selectUniqueBark } from './bark-dedupe.js';
 import { StateStore } from './state-store.js';
@@ -9,15 +16,34 @@ import { ModelClient } from './model-client.js';
 import { OmbreClient } from './ombre-client.js';
 import { BarkClient } from './bark-client.js';
 import { readOmbreHeartbeat } from './heartbeat-store.js';
-import { buildContextEnvelope, contextDeliveryState, recordContextDelivery } from './context-envelope.js';
+import { buildContextEnvelope, contextDeliveryState, recordContextDelivery, buildNowCompact } from './context-envelope.js';
 import { TransitionJournal } from './transition-journal.js';
 import { handleMcpMessage } from './mcp-protocol.js';
 import { OAuthProvider } from './oauth-provider.js';
 import { recordHandoffNote } from './handoff-notes.js';
 import { DashboardAuth } from './dashboard-auth.js';
 import { buildConnectionManifest, buildDashboardSnapshot } from './dashboard-projection.js';
-import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue } from './bridge-queue.js';
+import { BRIDGE_SERVER_PROTOCOL, BRIDGE_STREAM_PROTOCOL, BridgeQueue, bridgeDeliveryFromDashboard } from './bridge-queue.js';
 import { CabinStore } from './cabin-store.js';
+import { createRelevanceShadow, noteRecentTurn } from './relevance-shadow.js';
+import { guardTag, loadInteractionRules, splitExchange } from './interaction-rules.js';
+import { createAttentionWatch } from './attention-watch.js';
+import { dirname as pathDirname, join as pathJoin } from 'node:path';
+import { boardEnabled, postBoardMessage, readBoardMessages } from './board-client.js';
+import { SYSTEM_VERSION } from './version.js';
+import { memoryConnectionState } from './connection-diagnostics.js';
+import { PersonalityStore, computePersonalityStats } from './personality-store.js';
+import { CallStateStore, DrivePromptStore, loadDrivePrompts, pickDrivePrompt } from './drive-prompts.js';
+import { DrivePool, moodOf, slotOf, splitHint, POOL_LOW } from './drive-pool.js';
+import { DRIVE_KEYS as DRIVE_KEY_LIST, DRIVE_SHORT, driveLevel } from './dimensions.js';
+import { bodyLine, computeVitals, normalizeOffset } from './pulse.js';
+import { NowLines } from './now-lines.js';
+import { STREAM_MAX_CLIENTS, diffEvents } from './state-stream.js';
+
+// 情绪 → 记忆：只在开关打开时把此刻情绪坐标交给 OB 做共振排序。
+function emotionForOmbre(state) {
+  return config.ombre.emotionStamp ? emotionCoords(state) : null;
+}
 
 const config = validateConfig(loadConfig());
 if (!config.serviceToken) throw new Error('SERVICE_TOKEN is required');
@@ -31,7 +57,30 @@ if (config.serviceToken.length < 32) {
 
 const store = new StateStore(config.statePath, () => newState());
 const model = new ModelClient(config.model);
+// 4.3 做梦可以单独换模型：DREAM_MODEL_* 没配的项沿用 MODEL_*
+const dreamModel = new ModelClient({
+  ...config.model,
+  baseUrl: config.dreamModel.baseUrl || config.model.baseUrl,
+  apiKey: config.dreamModel.apiKey || config.model.apiKey,
+  name: config.dreamModel.name || config.model.name,
+});
 const ombre = new OmbreClient(config.ombre);
+const blackBox = new BlackBox(config.box.statePath);
+const drivePromptStore = new DrivePromptStore(config.bridge.drivePromptsStatePath);
+const drivePool = new DrivePool(config.bridge.drivePoolPath);
+// 10-26 脉：宿主报来的临时身体偏移（运动、紧张、发烧……），只在内存里，过期自动不算；不进状态、不进记忆
+const bodyOffsets = new Map();
+// 10-26 外接一行：只活在内存里，只给 GET /v1/now 用（见 src/now-lines.js 开头）
+const nowLines = new NowLines();
+// 10-26 订阅推送（src/state-stream.js）：连着的 SSE 客户端、每股劲儿上次推的时刻
+const stateStreams = new Set();
+const streamLastSent = new Map();
+function vitalsNow(state, now = new Date()) {
+  const nowMs = now.getTime();
+  for (const [k, o] of bodyOffsets) if (!(o.until > nowMs)) bodyOffsets.delete(k);
+  return computeVitals(state, now, { timeZone: config.settle.timeZone, offsets: [...bodyOffsets.values()] });
+}
+const callStateStore = new CallStateStore(config.bridge.callStatePath);
 const bark = new BarkClient(config.bark);
 const journal = new TransitionJournal(config.journalPath);
 const oauth = new OAuthProvider(config.oauth, (event, fields = {}) => log(event, fields));
@@ -42,14 +91,33 @@ const dashboardAuth = new DashboardAuth({
 });
 const bridgeQueue = new BridgeQueue(config.bridge.statePath, config.bridge);
 const cabin = new CabinStore(config.cabin.statePath, config.cabin);
+const personality = new PersonalityStore(config.personalityPath);
 const bridgeStreams = new Set();
 await oauth.init();
 let cyclePromise = null;
-const SYSTEM_VERSION = '2.5.12';
 
 function log(event, fields = {}) {
   console.log(JSON.stringify({ at: new Date().toISOString(), event, ...fields }));
 }
+
+// 【实验】Jev 相关性陪跑：只记日志，不改结果（见 relevance-shadow.js）
+const relevance = createRelevanceShadow({
+  apiKey: process.env.JEV_API_KEY ?? '',
+  enabled: process.env.JEV_SHADOW_ENABLED === 'true',
+  statePath: config.statePath,
+  nowText: async () => buildNowCompact(await store.read(), new Date(), { timeZone: config.settle.timeZone }).text,
+  log,
+});
+
+// 4.0 注意力监测（默认关闭，ATTENTION_ENABLED=true 才开）：手机上报 + 她说跟谁在一起 → 偏爱·吃醋。规则是参考值，见 attention-watch.js
+const attention = createAttentionWatch({
+  enabled: process.env.ATTENTION_ENABLED === 'true',
+  rulesPath: process.env.ATTENTION_RULES_PATH ?? '/app/configs/attention-rules.json',
+  statePath: pathJoin(pathDirname(config.statePath), 'attention.json'),
+  readState: () => store.read(),
+  record: (event) => recordConversationEvent(event, 'attention'),
+  log,
+});
 
 async function updateState(meta, mutate) {
   let before;
@@ -72,6 +140,13 @@ async function updateState(meta, mutate) {
   } catch (error) {
     log('transition_journal_failed', { type: meta.type, message: error.message });
   }
+  if (stateStreams.size) {
+    try {
+      for (const ev of diffEvents(before, after, new Date(), { meta, lastSent: streamLastSent })) {
+        for (const res of stateStreams) { res.write(`event: ${ev.type}\n`); res.write(`data: ${JSON.stringify(ev)}\n\n`); }
+      }
+    } catch (error) { log('state_stream_failed', { message: error.message }); }
+  }
   return after;
 }
 
@@ -88,7 +163,11 @@ async function applyResonanceFromMaterial(state, material, kind, now = new Date(
       domains: metadata.domains.slice(0, 8).join(','),
     },
     at: now,
-  }, (latest) => applyMemoryResonance(latest, metadata.domains, now, config.resonance).state);
+  }, (latest) => {
+    const next = applyMemoryResonance(latest, metadata.domains, now, config.resonance).state;
+    recordSurfacing(next, metadata.domains, now);
+    return next;
+  });
   log('memory_resonance', {
     kind,
     buckets: metadata.bucketIds.length,
@@ -177,22 +256,156 @@ async function synchronizeOmbreHeartbeat() {
   return state;
 }
 
+
+async function materialFromReferencedBuckets(recalled, maxLines = 7) {
+  const ids = recalled?.bucketIds ?? [];
+  if (!ids.length) return recalled?.text ?? '';
+  try {
+    const previews = await ombre.memoryBucketPreviews(ids, maxLines);
+    const domains = [...new Set(recalled?.domains ?? [])];
+    const domainMeta = domains.length ? `[domain:${domains.join(',')}]\n` : '';
+    const text = previews.map((item) => `${domainMeta}[bucket_id:${item.id}]\n${item.preview}`).join('\n\n');
+    return text || recalled?.text || '';
+  } catch (error) {
+    log('ombre_preview_failed', { count: ids.length, message: error.message });
+    return recalled?.text ?? '';
+  }
+}
+
+// 梦的推送（从 runCycle 里搬出来，3.3 改成早上发）：生成一句、去重、发 Bark、回流。
+async function sendDreamPush(state, dream, now) {
+  try {
+    let modelFailed = false;
+    const selected = await selectUniqueBark({
+      state,
+      onRejected: ({ attempt, similarity }) => log('bark_duplicate_rejected', { kind: 'dream', attempt, similarity }),
+      generate: async ({ recentMessages, rejectedMessage }) => {
+        if (modelFailed) return dream.residue;
+        try {
+          try { return await dreamModel.generateDreamPush({ dream, recentMessages, rejectedMessage }); }
+          catch (error) { if (!config.dreamModel.baseUrl) throw error; log('dream_push_model_fallback', { message: error.message }); return await model.generateDreamPush({ dream, recentMessages, rejectedMessage }); }   // 10-29 同上：Gemini 忙就用平常那个
+        } catch (error) {
+          modelFailed = true;
+          log('dream_push_model_failed', { message: error.message });
+          return dream.residue;
+        }
+      },
+    });
+    if (selected.reason === 'duplicate') log('bark_duplicate_skipped', { kind: 'dream', attempts: selected.attempts });
+    if (!selected.message) return state;
+    const result = await bark.send(selected.message);
+    if (!result.sent) return state;
+    state = await updateState({ type: 'bark_sent', source: 'bark', details: { barkSent: true, kind: 'dream' }, at: now },
+      (latest) => recordBark(latest, now, { kind: 'dream', message: selected.message }));
+    log('bark_sent', { kind: 'dream', revision: state.revision });
+    if (config.reflux.enabled) {
+      const expressed = topDrives(state)[0];
+      if (expressed) {
+        state = await updateState({ type: 'output_reflux', source: 'reflux', details: { kind: 'dream', drive: expressed.key }, at: now },
+          (latest) => applyOutputReflux(latest, expressed.key, selected.message, now, config.reflux.amount).state);
+        log('output_reflux', { kind: 'dream', drive: expressed.key, revision: state.revision });
+      }
+    }
+  } catch (error) { log('bark_failed', { kind: 'dream', message: error.message }); }
+  return state;
+}
+
 async function runCycle() {
   if (cyclePromise) return cyclePromise;
   cyclePromise = (async () => {
     const now = new Date();
     await synchronizeOmbreHeartbeat();
+    const driveBias = await personality.getDriveBias(now);
     let settled;
     await updateState({
       type: 'settle',
       source: 'timer',
       at: now,
     }, (state) => {
-      settled = settleState(state, now, config.sleepAfterMinutes, config.settle);
+      settled = settleState(state, now, config.sleepAfterMinutes, { ...config.settle, driveBias });
       return settled.state;
     });
 
     let state = settled.state;
+    // 自我觉察：每天扫一次（上海日期变了才扫），从轨迹里挑候选。只加候选，不动别的。
+    if (config.awareness.enabled) {
+      const preview = scanAwareness(state, now, { timeZone: config.settle.timeZone });
+      if (preview.changed) {
+        state = await updateState({
+          type: 'awareness_scan',
+          source: 'timer',
+          details: { added: preview.added.length, kinds: preview.added.map((c) => c.kind) },
+          at: now,
+        }, (latest) => scanAwareness(latest, now, { timeZone: config.settle.timeZone }).state);
+        if (preview.added.length) log('awareness_candidates', { added: preview.added.map((c) => `${c.kind}:${c.subject}`) });
+      }
+    }
+    // 黑匣子到点提醒：到时自动露头；桥开着就再递一句到窗口（只说标题，不说正文）。
+    try {
+      const due = await blackBox.dueReminders(now);
+      if (due.length) log('box_reminders_due', { count: due.length });
+      if (due.length && config.bridge.enabled && config.bridge.selfSignals) {
+        for (const item of due) {
+          const title = item.title || `${item.text.slice(0, 20)}${item.text.length > 20 ? '…' : ''}`;
+          try {
+            await bridgeQueue.enqueue({ eventId: `box-remind-${item.id}`, reason: 'self_signal', message: `匣子里有一条到点了：${title}${item.when ? `（事在 ${item.when.slice(5, 10).replace('-', '/')}）` : ''}。xinchao_box read ${item.id}`, ttlHours: 12 }, now);
+          } catch (error) { log('box_reminder_enqueue_failed', { id: item.id, message: error.message }); }
+        }
+        await publishReadyBridgeDeliveries();
+      }
+    } catch (error) { log('box_reminders_failed', { message: error.message }); }
+    // 心潮自身信号（3.3）：检测"发生了什么"，经桥递到窗口。先入队再记状态，入队失败不记（下轮再试）。
+    if (config.bridge.enabled && config.bridge.selfSignals) {
+      const preview = detectSelfSignals(state, now, { timeZone: config.settle.timeZone, dawnFreezeStart: config.settle.dawnFreezeStart, dawnFreezeEnd: config.settle.dawnFreezeEnd, awarenessReviewWeekday: config.awareness.reviewWeekday, longing: { timeZone: config.settle.timeZone, ...config.longing } });
+      if (preview.signals.length) {
+        let queued = 0;
+        for (const signal of preview.signals) {
+          try {
+            await bridgeQueue.enqueue({ eventId: signal.eventId, reason: 'self_signal', message: signal.text, ttlHours: preview.ttlHours }, now);
+            queued += 1;
+          } catch (error) { log('self_signal_enqueue_failed', { kind: signal.kind, message: error.message }); }
+        }
+        if (queued) await publishReadyBridgeDeliveries();
+      }
+      if (preview.changed) {
+        state = await updateState({
+          type: 'self_signals',
+          source: 'timer',
+          details: { signals: preview.signals.map((s) => `${s.kind}:${s.subject}`) },
+          at: now,
+        }, (latest) => detectSelfSignals(latest, now, { timeZone: config.settle.timeZone, dawnFreezeStart: config.settle.dawnFreezeStart, dawnFreezeEnd: config.settle.dawnFreezeEnd, awarenessReviewWeekday: config.awareness.reviewWeekday, longing: { timeZone: config.settle.timeZone, ...config.longing } }).state);
+        if (preview.signals.length) log('self_signals', { kinds: preview.signals.map((s) => `${s.kind}:${s.subject}`) });
+      }
+      // 驱力提示（10-15）：不靠窗口里的保活闹钟，心潮自己按节奏递。先入队再记，入队失败不记（下轮再试）
+      try {
+        const prompts = await loadDrivePrompts(config.bridge.drivePromptsPath);
+        if (prompts) {
+          const before = await drivePromptStore.read();
+          const pick = pickDrivePrompt(state, before, prompts, now, { timeZone: config.settle.timeZone, dayMax: config.bridge.drivePromptDayMax, nightMax: config.bridge.drivePromptNightMax, nightSkipChatMinutes: config.bridge.drivePromptNightSkipChatMinutes, minGapMinutes: config.bridge.drivePromptMinGapMinutes, presentSkipMinutes: config.bridge.drivePromptPresentSkipMinutes, call: await callStateStore.read(), busy: await attention.busyNow(now.getTime()) });
+          // 10-26 念头罐：开头那句从「这股劲儿 × 这个时段」那罐里抽（同心情优先），抽不到就用话术原句；快见底就后台续罐
+          if (pick.text && pick.drive && !pick.summary && config.bridge.drivePoolEnabled) {
+            const { head } = splitHint(prompts.hints[pick.drive]);
+            if (head) {
+              const slot = slotOf(localDayAndHour(now, config.settle.timeZone).hour);
+              const mood = moodOf(state);
+              const short = DRIVE_SHORT[pick.drive] ?? pick.drive;
+              try {
+                const got = await drivePool.take(pick.drive, slot, mood);
+                if (got.text) pick.text = pick.text.replace(`）：${head}`, `）：${got.text}`);
+                if (got.left < POOL_LOW) drivePool.refill({ model, key: pick.drive, short, head, slot, mood, emotionLabel: state?.emotion?.label ?? '', log });
+              } catch (error) { log('drive_pool_failed', { message: error.message }); }
+            }
+          }
+          if (pick.text) {
+            await bridgeQueue.enqueue({ eventId: `drive-prompt-${pick.drive}-${Math.floor(now.getTime() / 60_000)}`, reason: 'self_signal', message: `${pick.text}\n${renderNowLine(state, now)}`, ttlHours: 1 }, now);
+            await publishReadyBridgeDeliveries();
+            log('drive_prompt', { drive: pick.drive, count: pick.record.count, ...(pick.summary ? { summary: true, released: pick.released, dropped: pick.dropped } : {}) });
+          } else if (pick.held) log('drive_prompt_stashed', { drive: pick.held, reason: pick.reason });   // 10-29 攒着（通话中/她在忙/刚说过）
+          else if (pick.dropped?.length) log('drive_prompt_stash_dropped', { dropped: pick.dropped });   // 放之前核过，都落下去了
+          if (JSON.stringify(pick.record) !== JSON.stringify(before)) await drivePromptStore.write(pick.record);
+        }
+      } catch (error) { log('drive_prompt_failed', { message: error.message }); }
+    }
     let dreamCreated = false;
     let barkSent = false;
     let daytimeSent = false;
@@ -219,24 +432,63 @@ async function runCycle() {
 
     if (config.dreamEnabled && dreamAllowed(state, now, config.dreamMinIntervalHours, config.dreamMaxPerDay, config.dreamWindow)) {
       let material = '';
+      let sourceOmbreBucketIds = [];
       if (!config.shadowMode && config.ombre.readEnabled) {
-        try { material = await ombre.recentMaterial(topDrives(state)); }
+        try {
+          // 3.3：原料换成"记忆正在消化的东西"（OB dream 全量，去技术类），消化里没东西再退回按驱力捞
+          const digest = await ombre.digestMaterial(48);
+          if (digest.text) { material = digest.text; sourceOmbreBucketIds = digest.bucketIds; relevance.judge('做梦·消化', digest.text); }
+          else {
+            const recalled = await ombre.recentMaterialWithRefs(topDrives(state), emotionForOmbre(state));
+            sourceOmbreBucketIds = recalled.bucketIds;
+            material = await materialFromReferencedBuckets(recalled);
+            relevance.judge('做梦', material);
+          }
+          log('dream_material', { digestTotal: digest.total, kept: digest.kept, domains: digest.domains.slice(0, 8).join(',') });
+        }
         catch (error) { log('ombre_read_failed', { message: error.message }); }
       }
+      let farMaterial = '';
+      if (!config.shadowMode && config.ombre.readEnabled) {
+        try { const far = await ombre.farMaterial(now); farMaterial = far.text; relevance.judge('做梦·远期', far.text); sourceOmbreBucketIds = [...new Set([...sourceOmbreBucketIds, ...far.bucketIds])]; }
+        catch (error) { log('ombre_far_failed', { message: error.message }); }
+      }
+      const avoid = state.recentDreams.slice(-3).map((d) => d.image || String(d.residue || '').slice(0, 30)).filter(Boolean);
+      const sleepHours = state.sleepStartedAt ? (now.getTime() - Date.parse(state.sleepStartedAt)) / 3_600_000 : null;
 
       let generated;
       if (config.shadowMode) {
         generated = new ModelClient({ ...config.model, enabled: false }).fallback(topDrives(state));
       } else {
+        const recentSourceMemoryIds = state.recentDreams.slice(-3).flatMap((dream) => dream.sourceOmbreBucketIds ?? []);
+        const args = { state, material, farMaterial, topDrives: topDrives(state), avoid, emotion: emotionSummary(state, now), sleepHours, recentSourceMemoryIds };
         try {
-          generated = await model.generateDream({ state, material, topDrives: topDrives(state) });
+          generated = await dreamModel.generateDream(args);
         } catch (error) {
           log('dream_model_failed', { message: error.message });
-          generated = new ModelClient({ ...config.model, enabled: false }).fallback(topDrives(state));
+          // 10-29：做梦单独配了模型（Gemini 偶尔 503 太忙）时，先退回平常那个模型写，再不行才用规则拼
+          try {
+            if (dreamModel === model || !config.dreamModel.baseUrl) throw error;
+            generated = await model.generateDream(args);
+            log('dream_model_fallback', { to: config.model.name });
+          } catch (again) {
+            if (again !== error) log('dream_model_failed', { message: again.message, fallback: true });
+            generated = new ModelClient({ ...config.model, enabled: false }).fallback(topDrives(state));
+          }
         }
       }
 
-      const dream = { id: randomUUID(), createdAt: now.toISOString(), ...generated, ombreBucketId: null };
+      const dream = {
+        id: randomUUID(),
+        createdAt: now.toISOString(),
+        ...generated,
+        // ombreBucketId 保持旧语义：这场梦写入 OB 后自己的桶。
+        ombreBucketId: null,
+        // 新字段只记梦由哪些真实记忆长出，老状态没有它也完全可读。
+        sourceOmbreBucketIds,
+        driveKey: topDrives(state)[0]?.key ?? null,
+        sleepHours: sleepHours == null ? null : Number(sleepHours.toFixed(2)),
+      };
       if (!config.shadowMode && config.ombre.writeEnabled) {
         try { dream.ombreBucketId = await ombre.storeDream(dream); }
         catch (error) { log('ombre_write_failed', { message: error.message }); }
@@ -254,53 +506,29 @@ async function runCycle() {
       dreamCreated = true;
       log('dream_settled', { source: dream.source, shadow: config.shadowMode, usedBreath: Boolean(material), revision: state.revision });
 
-      if (!config.shadowMode && config.bark.enabled && dreamContactIsIdle && barkAllowed(state, now, config.bark.minIntervalHours, config.bark.maxPerDay, 'dream')) {
-        try {
-          let modelFailed = false;
-          const selected = await selectUniqueBark({
-            state,
-            onRejected: ({ attempt, similarity }) => log('bark_duplicate_rejected', { kind: 'dream', attempt, similarity }),
-            generate: async ({ recentMessages, rejectedMessage }) => {
-              if (modelFailed) return dream.residue;
-              try {
-                return await model.generateDreamPush({ dream, recentMessages, rejectedMessage });
-              } catch (error) {
-                modelFailed = true;
-                log('dream_push_model_failed', { message: error.message });
-                return dream.residue;
-              }
-            },
-          });
-          if (selected.reason === 'duplicate') {
-            log('bark_duplicate_skipped', { kind: 'dream', attempts: selected.attempts });
-          }
-          if (selected.message) {
-            const result = await bark.send(selected.message);
-            if (result.sent) {
-              state = await updateState({
-                type: 'bark_sent',
-                source: 'bark',
-                details: { barkSent: true, kind: 'dream' },
-                at: now,
-              }, (latest) => recordBark(latest, now, { kind: 'dream', message: selected.message }));
-              barkSent = true;
-              log('bark_sent', { kind: 'dream', revision: state.revision });
-              // 回流补全：他把梦余韵分享给她，也是一次向她的表达 → 回流进思维池（同自主念头）。
-              if (config.reflux.enabled) {
-                const expressed = topDrives(state)[0];
-                if (expressed) {
-                  state = await updateState({
-                    type: 'output_reflux',
-                    source: 'reflux',
-                    details: { kind: 'dream', drive: expressed.key },
-                    at: now,
-                  }, (latest) => applyOutputReflux(latest, expressed.key, selected.message, now, config.reflux.amount).state);
-                  log('output_reflux', { kind: 'dream', drive: expressed.key, revision: state.revision });
-                }
-              }
-            }
-          }
-        } catch (error) { log('bark_failed', { kind: 'dream', message: error.message }); }
+      // 3.3：梦做完不在凌晨推。攒着，到她常来的点前后再推"昨晚梦到……"（见下面 pendingDreamPush）。
+      if (!config.shadowMode && config.bark.enabled) {
+        state = await updateState({ type: 'dream_push_pending', source: 'dream', details: { dreamId: dream.id }, at: now },
+          (latest) => ({ ...latest, pendingDreamPush: { dreamId: dream.id, createdAt: now.toISOString() } }));
+      }
+    }
+
+    // 早上推梦：她常来的点前后（期待 ≥0.3）或 9 点之后；14 小时没推出去就作废；仍受 Bark 总闸和 3 小时空档。
+    if (!config.shadowMode && config.bark.enabled && state.pendingDreamPush) {
+      const pending = state.pendingDreamPush;
+      const ageH = (now.getTime() - Date.parse(pending.createdAt)) / 3_600_000;
+      const { hour } = localDayAndHour(now, config.settle.timeZone);
+      const dream = state.recentDreams.find((d) => d.id === pending.dreamId);
+      const anticipation = computeAnticipation(state, now, { timeZone: config.settle.timeZone });
+      const morning = hour >= 8 && (anticipation >= 0.3 || hour >= 9);
+      if (!dream || ageH > 14) {
+        state = await updateState({ type: 'dream_push_dropped', source: 'dream', details: { dreamId: pending.dreamId, ageH: Number(ageH.toFixed(1)) }, at: now },
+          (latest) => ({ ...latest, pendingDreamPush: null }));
+        log('dream_push_dropped', { dreamId: pending.dreamId, ageH: Number(ageH.toFixed(1)) });
+      } else if (morning && dreamContactIsIdle && barkAllowed(state, now, config.bark.minIntervalHours, config.bark.maxPerDay, 'dream')) {
+        state = await sendDreamPush(state, dream, now);
+        state = await updateState({ type: 'dream_push_sent', source: 'dream', details: { dreamId: dream.id }, at: now },
+          (latest) => ({ ...latest, pendingDreamPush: null }));
       }
     }
 
@@ -310,8 +538,18 @@ async function runCycle() {
       // 只取一次：selectUniqueBark 去重失败时会重试生成，材料跟着重取的话
       // 一条通知能打出好几次 OB 往返，而浮现的东西本来就该是同一件事。
       let thoughtMaterial = '';
+      let thoughtSourceBucketIds = [];
       if (config.ombre.readEnabled) {
-        try { thoughtMaterial = await ombre.thoughtMaterial(topDrives(state)); }
+        try {
+          const recalled = await ombre.thoughtMaterialWithRefs(topDrives(state), emotionForOmbre(state), now, recentSurfacedBucketIds(state, now));
+          thoughtSourceBucketIds = recalled.bucketIds;
+          if (recalled.bucketIds.length) {
+            state = await updateState({ type: 'surfaced_buckets', source: 'autonomous', details: { count: recalled.bucketIds.length }, at: now },
+              (latest) => recordSurfacedBuckets(latest, recalled.bucketIds, now));
+          }
+          thoughtMaterial = await materialFromReferencedBuckets(recalled, 5);
+          relevance.judge('浮现·念头', thoughtMaterial);
+        }
         catch (error) { log('ombre_read_failed', { message: error.message }); }
       }
       if (config.resonance.enabled && thoughtMaterial) {
@@ -360,7 +598,17 @@ async function runCycle() {
                   source: 'reflux',
                   details: { kind: 'autonomous_thought', drive: expressed.key },
                   at: now,
-                }, (latest) => applyOutputReflux(latest, expressed.key, selected.message, now, config.reflux.amount).state);
+                }, (latest) => applyOutputReflux(
+                  latest,
+                  expressed.key,
+                  selected.message,
+                  now,
+                  config.reflux.amount,
+                  {
+                    ombreBucketId: thoughtSourceBucketIds[0] ?? null,
+                    sourceOmbreBucketIds: thoughtSourceBucketIds,
+                  },
+                ).state);
                 log('output_reflux', { kind: 'autonomous_thought', drive: expressed.key, revision: state.revision });
               }
             }
@@ -376,15 +624,40 @@ async function runCycle() {
         at: now,
       }, (latest) => scheduleDaytimeEmergence(latest, now, config.daytime.minIntervalHours, config.daytime.maxIntervalHours));
       log('daytime_emergence_scheduled', { nextAt: state.nextDaytimeEmergenceAt, revision: state.revision });
-    } else if (!config.shadowMode && config.daytime.enabled && config.ombre.readEnabled && config.bark.enabled && daytimeEmergenceAllowed(state, now, config.daytime)) {
+    } else if (!config.shadowMode && config.daytime.enabled && config.ombre.readEnabled && (!config.daytime.bark || config.bark.enabled) && daytimeEmergenceAllowed(state, now, config.daytime)) {
       let selected = { message: '', candidate: { source: 'none' }, reason: 'empty', attempts: 1 };
       try {
-        const material = await ombre.daytimeMaterial(topDrives(state));
+        const recalled = await ombre.daytimeMaterialWithRefs(topDrives(state), emotionForOmbre(state), now, recentSurfacedBucketIds(state, now));
+        if (recalled.bucketIds.length) {
+          state = await updateState({ type: 'surfaced_buckets', source: 'daytime', details: { count: recalled.bucketIds.length }, at: now },
+            (latest) => recordSurfacedBuckets(latest, recalled.bucketIds, now));
+        }
+        const material = await materialFromReferencedBuckets(recalled, 5);
+        relevance.judge('浮现', material);
         if (config.resonance.enabled && material) {
           try { state = await applyResonanceFromMaterial(state, material, 'daytime_emergence', now); }
           catch (error) { log('memory_resonance_failed', { kind: 'daytime_emergence', message: error.message }); }
         }
+        // 浮现 → 念头池：不代笔，不推她。取这次浮现的第一句当闪念，挂在最亲和的那一维上。
         if (material.trim()) {
+          const domains = parseSurfacedDomains(material);
+          const key = surfacedDriveKey(domains, state);
+          const firstLine = material.split('\n').map((l) => l.trim()).find((l) => l && !/^\[/.test(l)) || '';
+          if (key && firstLine) {
+            state = await updateState({
+              type: 'surfaced_thought',
+              source: 'daytime',
+              details: { drive: key, domains: domains.slice(0, 6).join(',') },
+              at: now,
+            }, (latest) => applySurfacedThought(latest, key, firstLine, now, 0.45, { ombreBucketId: recalled.bucketIds[0] ?? null, sourceOmbreBucketIds: recalled.bucketIds }).state);
+            log('surfaced_thought', { drive: key, domains: domains.length, revision: state.revision });
+          }
+          if (!config.daytime.bark) {
+            state = await updateState({ type: 'daytime_emergence_noted', source: 'daytime', at: now },
+              (latest) => recordDaytimeEmergence(latest, firstLine, now, config.daytime.timeZone, { silent: true }));
+          }
+        }
+        if (material.trim() && config.daytime.bark) {
           selected = await selectUniqueBark({
             state,
             onRejected: ({ attempt, similarity }) => log('bark_duplicate_rejected', { kind: 'daytime_emergence', attempt, similarity }),
@@ -417,7 +690,17 @@ async function runCycle() {
                   source: 'reflux',
                   details: { kind: 'daytime_emergence', drive: expressed.key },
                   at: now,
-                }, (latest) => applyOutputReflux(latest, expressed.key, selected.message, now, config.reflux.amount).state);
+                }, (latest) => applyOutputReflux(
+                  latest,
+                  expressed.key,
+                  selected.message,
+                  now,
+                  config.reflux.amount,
+                  {
+                    ombreBucketId: recalled.bucketIds[0] ?? null,
+                    sourceOmbreBucketIds: recalled.bucketIds,
+                  },
+                ).state);
                 log('output_reflux', { kind: 'daytime_emergence', drive: expressed.key, revision: state.revision });
               }
             }
@@ -425,7 +708,7 @@ async function runCycle() {
         } catch (error) {
           log('bark_failed', { kind: 'daytime_emergence', message: error.message });
         }
-      } else {
+      } else if (config.daytime.bark) {
         log('daytime_emergence_skipped', { reason: selected.reason === 'duplicate' ? 'duplicate' : 'no_pushworthy_material' });
       }
       state = await updateState({
@@ -560,7 +843,12 @@ function dashboardTimelineOptions(url) {
 
 async function dashboardPayload(pathname, url) {
   if (pathname.endsWith('/snapshot')) {
-    return buildDashboardSnapshot(await store.read(), config, new Date());
+    const now = new Date();
+    const [state, personalityCore] = await Promise.all([
+      store.read(),
+      personality.getPersonalityCore(now),
+    ]);
+    return buildDashboardSnapshot(state, config, now, personalityCore);
   }
   if (pathname.endsWith('/timeline')) {
     return {
@@ -575,7 +863,7 @@ async function dashboardPayload(pathname, url) {
         schemaVersion: 2,
         generatedAt: new Date().toISOString(),
         available: false,
-        reason: 'not_configured',
+        reason: memoryConnectionState(config),
         total: 0,
         stats: {},
         stars: [],
@@ -610,8 +898,25 @@ async function dashboardPayload(pathname, url) {
       };
     }
   }
+  if (pathname.endsWith('/memory-bucket')) {
+    const bucketId = String(url.searchParams.get('id') ?? '').trim();
+    if (!/^[A-Za-z0-9._-]{1,160}$/.test(bucketId)) {
+      return { schemaVersion: 1, available: false, reason: 'invalid_id', id: bucketId, preview: '', lineCount: 0, truncated: false };
+    }
+    try {
+      return await ombre.memoryBucketPreview(bucketId, 7);
+    } catch (error) {
+      log('dashboard_memory_bucket_failed', { bucket: auditEventFingerprint(bucketId), message: error.message });
+      return { schemaVersion: 1, available: false, reason: 'ombre_unavailable', id: bucketId, preview: '', lineCount: 0, truncated: false };
+    }
+  }
   if (pathname.endsWith('/connect')) return buildConnectionManifest(config);
   if (pathname.endsWith('/cabin')) return cabin.snapshot();
+  if (pathname.endsWith('/personality')) return personality.getPersonalityCore();
+  if (pathname.endsWith('/pending')) {
+    // 3.3：攒下的话退役，黑匣子接替。人类看不到匣子，这里只回一个说明，不回条目。
+    return { schemaVersion: 2, generatedAt: new Date().toISOString(), retired: true, items: [], note: '攒下的话已并入黑匣子（只有 AI 能看）；这一页可以下线了。' };
+  }
   return null;
 }
 
@@ -646,7 +951,8 @@ async function createContextEnvelope({
     && config.ombre.readEnabled
   ) {
     try {
-      ombreText = await ombre.recentContinuityMaterial(config.context.ombreMaxTokens);
+      ombreText = await ombre.recentContinuityMaterial(config.context.ombreMaxTokens, emotionForOmbre(state));
+      relevance.judge('近期', ombreText);
       try { state = await applyResonanceFromMaterial(state, ombreText, 'context_continuity', now); }
       catch (error) { log('memory_resonance_failed', { kind: 'context_continuity', message: error.message }); }
     } catch (error) {
@@ -654,10 +960,38 @@ async function createContextEnvelope({
       log('context_ombre_read_failed', { message: error.message });
     }
   }
+  // 行为锚点随信封下发（缓存读取，极便宜）；读不到就当没有，不阻塞信封。
+  let personalityAnchors = [];
+  try { personalityAnchors = (await personality.getPersonalityCore(now)).anchors ?? []; } catch { personalityAnchors = []; }
+  let boxCount = 0; let boxSurfaced = [];
+  let boxStaleCount = 0;
+  try { boxCount = await blackBox.count(now); boxSurfaced = await blackBox.surfaced(now); boxStaleCount = (await blackBox.stale(now)).length; } catch { boxCount = 0; boxSurfaced = []; }
+  // 官方客户端版：没被 Bridge 接走的自身信号，在这里带出去（带出即 delivered）；小屋 24h 内的来信只报条数。
+  let awaySignals = [];
+  if (config.bridge.enabled) {
+    try {
+      awaySignals = (await bridgeQueue.ready(now)).filter((d) => d.reason === 'self_signal').slice(-5)
+        .map((d) => ({ id: d.id, createdAt: d.createdAt, text: String(d.message ?? '').split('\n')[0] }));
+    } catch { awaySignals = []; }
+  }
+  let cabinUnread = 0;
+  let cabinLocked = 0;
+  try {
+    const box = await cabin.aiInbox({ mineLimit: 0 });
+    cabinUnread = box.letters.filter((n) => !n.aiReadAt).length;   // 没读过就一直提示，不按写信时间过期
+    cabinLocked = box.lockedCount;   // 上锁的信不过期提醒：一直在，直到她开锁或删掉
+  } catch { cabinUnread = 0; cabinLocked = 0; }
   const envelope = buildContextEnvelope({
+    awarenessReviewWeekday: config.awareness.reviewWeekday,
     state,
     sessionId,
     mode,
+    boxCount,
+    boxSurfaced,
+    boxStale: boxStaleCount,
+    awaySignals,
+    cabinUnread,
+    cabinLocked,
     ombreText,
     maxTokens,
     ttlMinutes: config.context.ttlMinutes,
@@ -665,8 +999,12 @@ async function createContextEnvelope({
     alreadyDelivered: delivery.alreadyDelivered,
     force,
     timeZone: config.settle.timeZone,
+    personalityAnchors,
   });
   if (envelope.delivered) {
+    for (const sig of awaySignals) {
+      try { await bridgeQueue.acknowledge(sig.id, 'delivered', '', now); } catch { /* 回执失败下次再带 */ }
+    }
     state = await updateState({
       type: 'context_delivery',
       source: 'context-adapter',
@@ -680,12 +1018,15 @@ async function createContextEnvelope({
         sectionCount: envelope.sections.length,
       },
       at: now,
-    }, (current) => recordContextDelivery(current, {
-      sessionId,
-      mode,
-      digest: envelope.digest,
-      deliveredAt: now,
-    }));
+    }, (current) => {
+      const next = recordContextDelivery(current, {
+        sessionId,
+        mode,
+        digest: envelope.digest,
+        deliveredAt: now,
+      });
+      return next;
+    });
   }
   try {
     await journal.recordContext({
@@ -705,9 +1046,62 @@ async function createContextEnvelope({
   return ombreWarning ? { ...envelope, warnings: [ombreWarning] } : envelope;
 }
 
+// 没填类型但给了 exchange（她的一句 + 他的一段）→ 服务端替接收端判互动类型和氛围。
+// MCP（官方客户端版）和 REST /v1/conversation-event（自建运行时）共用；8 分钟内不重复判，和客户端钩子的节流一致。
+// exchange 正文只走这一跳：判完即删，不进状态、不进审计。
+// 4.0：互动判断的把关规则（词表、远近名单都是参考值）。每家可以在 configs/interaction-rules.json 覆盖，一分钟重读一次
+const RULES_PATH = process.env.INTERACTION_RULES_PATH ?? '/app/configs/interaction-rules.json';
+let rulesCache = { at: 0, rules: null };
+function interactionRules() {
+  if (!rulesCache.rules || Date.now() - rulesCache.at > 60_000) rulesCache = { at: Date.now(), rules: loadInteractionRules(RULES_PATH) };
+  return rulesCache.rules;
+}
+const recentClassified = [];   // 最近判过的类型（只在内存里，给「刚亲近完」「被晾着要有前文」这几道门用）
+const MARK_TYPES = new Set(['affection', 'intimacy', 'empathy', 'loss', 'conflict', 'slighted']);
+
+async function classifyExchange(event, source = 'api') {
+  if (event.interactionType === undefined && event.interaction_type !== undefined) event.interactionType = event.interaction_type;
+  // cause：她那句让他不痛快的话（≤60 字），只在冲突时有意义；接收端可以直接给，也可以由 exchange 里截出来
+  event.cause = String(event.cause ?? '').replace(/\s+/g, ' ').trim().slice(0, 60) || undefined;
+  const exchange = String(event.exchange ?? '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+  delete event.exchange;
+  // 09-28 和好两道关：留下她那句（≤80 字）给引擎核对有没有明确松口；只在内存里过这一跳，不落盘
+  if (exchange && !event.herWords && !event.her_words) event.herWords = (exchange.match(/她说：(.+?)(?:\s*他回：|$)/)?.[1] ?? exchange).trim().slice(0, 80);
+  if (event.interactionType || !exchange || !config.model.enabled) return null;
+  const snapshot = await store.read();
+  const lastAt = Date.parse(snapshot.interactionClassifyAt ?? '');
+  if (Number.isFinite(lastAt) && Date.now() - lastAt < (config.interaction?.classifyMinMinutes ?? 8) * 60_000) return { skipped: 'throttled' };
+  try {
+    const raw = await model.classifyInteraction(exchange);
+    if (!raw) return null;
+    const { her } = splitExchange(exchange);
+    const nowMs = Date.now();
+    while (recentClassified.length && nowMs - recentClassified[0].at > 30 * 60_000) recentClassified.shift();
+    const tag = guardTag(raw, her, { rules: interactionRules(), recent: [...recentClassified], hasGrudge: Boolean(snapshot.grudge), now: nowMs });
+    recentClassified.push({ type: tag.type, at: nowMs });
+    while (recentClassified.length > 3) recentClassified.shift();
+    event.interactionType = tag.type;
+    if (tag.sub) event.sub = tag.sub;
+    if (tag.strength && (tag.type === 'affection' || tag.type === 'intimacy')) event.strength = tag.strength;
+    if (tag.type === 'empathy') { event.closeness = tag.closeness; if (tag.who) event.who = tag.who; }
+    // 浮标点开看到的是她这句原话的前 40 字（网页开了私密文字才显示）
+    if (MARK_TYPES.has(tag.type) && !event.note) event.note = her.slice(0, 40);
+    event.sessionState = { ...(event.sessionState ?? event.session_state ?? {}), tone: tag.tone, warmth: tag.warmth, tension: tag.tension };
+    if (tag.type === 'conflict' && !event.cause) {
+      const her = exchange.match(/她说：(.+?)(?:\s*他回：|$)/);
+      if (her) event.cause = her[1].trim().slice(0, 60);
+    }
+    await updateState({ type: 'interaction_classified', source, details: { type: tag.type, tone: tag.tone }, at: new Date() },
+      (current) => ({ ...current, interactionClassifyAt: new Date().toISOString() }));
+    log('interaction_classified', { type: tag.type, tone: tag.tone, source, ...(tag.sub ? { sub: tag.sub } : {}), ...(tag.guarded ? { guarded: tag.guarded } : {}) });
+    return { type: tag.type, tone: tag.tone, ...(tag.sub ? { sub: tag.sub } : {}), ...(tag.guarded ? { guarded: tag.guarded } : {}) };
+  } catch (error) { log('interaction_classify_failed', { message: error.message }); return null; }
+}
+
 async function recordConversationEvent(event, source = 'api', now = new Date()) {
   let applied;
   const auditDetails = {};
+  const driveBias = await personality.getDriveBias(now);
   const state = await updateState({
     type: source === 'heartbeat' ? 'conversation_heartbeat' : 'conversation_event',
     source: source === 'mcp' ? 'mcp' : 'api',
@@ -717,8 +1111,12 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     at: now,
   }, (current) => {
     applied = settleAndApplyConversationEvent(current, event, now, {
+      // 3.3.10：AI 自己带着互动类型回传、又没附她原话（exchange）的 MCP 事件，只改驱力、不叫醒、不计作息。
+      // 不带类型的裸事件是客户端钩子在她每条消息时发的"她来了"信号（通话里她说的每句也走这里），照旧算在场。
+      presence: (source !== 'mcp' && source !== 'attention') || Boolean(String(event.exchange ?? '').trim())
+        || !String(event.interactionType ?? event.interaction_type ?? '').trim(),
       sleepAfterMinutes: config.sleepAfterMinutes,
-      settle: config.settle,
+      settle: { ...config.settle, driveBias },
       interaction: config.interaction,
       // 作息预期只从她真实的到来学习，心跳不算。
       recordArrival: config.anticipation.enabled && source !== 'heartbeat',
@@ -743,6 +1141,90 @@ async function recordConversationEvent(event, source = 'api', now = new Date()) 
     interaction: applied.interaction,
     settledHours: Number(applied.settled.elapsedHours.toFixed(4)),
   };
+}
+
+// 黑匣子：put / list / read / unpin / burn / keep。唯一入口，没有 HTTP 路由。
+async function handleBox(input = {}, now = new Date()) {
+  const action = String(input.action ?? '').trim().toLowerCase();
+  if (action === 'put') {
+    const item = await blackBox.put({ text: input.text, kind: input.kind, title: input.title, expiresHours: input.expiresHours, surface: input.surface, when: input.when, remindAt: input.remindAt }, now);
+    log('box_put', { id: item.id, kind: item.kind });
+    return { text: `放进匣子了：[${item.id}] ${item.kind}${item.when ? `，事在 ${item.when.slice(0, 10)}` : ''}${item.remindAt ? `，${item.remindAt.slice(5, 16).replace('T', ' ')} 提醒` : ''}${item.expiresAt ? `，${item.expiresAt.slice(0, 10)} 到期` : ''}${item.similar?.length ? `\n可能重复：${item.similar.map((x) => `[${x.id}] ${x.title}`).join('；')}——合并还是另放你定（合并就 burn 掉旧的或这条）` : ''}`, data: { id: item.id, kind: item.kind, createdAt: item.createdAt, expiresAt: item.expiresAt, similar: item.similar ?? [] } };
+  }
+  if (action === 'list') {
+    const items = await blackBox.list(now);
+    const stale = await blackBox.stale(now);
+    const staleIds = new Map(stale.map((x) => [x.id, x]));
+    return { text: `匣子里有 ${items.length} 条${stale.length ? `，其中 ${stale.length} 条标了 ⏳（放久了没动，或提醒过还没烧）——烧不烧你定，不会自动删` : ''}。\n${renderBoxList(items, now, staleIds)}`, data: { count: items.length, ids: items.map((x) => x.id), stale: stale.map((x) => x.id) } };
+  }
+  if (action === 'read') {
+    const item = await blackBox.read(input.id, now);
+    if (!item) return { text: `匣子里没有这条：${input.id ?? ''}`, data: { found: false } };
+    return { text: `[${item.id}] ${item.kind}${item.title ? ` · ${item.title}` : ''}（${item.createdAt.slice(0, 16).replace('T', ' ')}）\n${item.text}`, data: { found: true, id: item.id } };
+  }
+  if (action === 'unpin') {
+    const ok = await blackBox.unpin(input.id, now);
+    return { text: ok ? `不再提醒了（条目还在）：${input.id}` : `匣子里没有这条：${input.id ?? ''}`, data: { unpinned: ok } };
+  }
+  if (action === 'burn') {
+    const ok = await blackBox.burn(input.id, now);
+    if (ok) log('box_burn', { id: input.id });
+    return { text: ok ? `烧了：${input.id}` : `匣子里没有这条：${input.id ?? ''}`, data: { burned: ok } };
+  }
+  if (action === 'keep') {
+    const item = await blackBox.read(input.id, now);
+    if (!item) return { text: `匣子里没有这条：${input.id ?? ''}`, data: { found: false } };
+    if (!config.ombre.writeEnabled || config.shadowMode) return { text: 'OB 写入没开，搬不出去。', data: { kept: false } };
+    const bucketId = await ombre.storeHeldOutput({ content: item.text });
+    await blackBox.markKept(item.id, bucketId, now);
+    log('box_keep', { id: item.id, bucketId });
+    return { text: `搬进 OB 了：${item.id} → ${bucketId}。匣子里那条还在，想烧就烧。`, data: { kept: true, bucketId } };
+  }
+  throw new Error('action 必须是 put / list / read / burn / keep');
+}
+
+// 自我觉察工具：list / confirm / dismiss / scan。确认时若 OB 写开关打开，经 I 沉淀为候选自我认知。
+async function handleAwareness(input = {}, now = new Date()) {
+  const action = String(input.action ?? 'list').trim().toLowerCase();
+  if (action === 'list') return { action, ...awarenessSummary(await store.read()) };
+  if (action === 'scan') {
+    const state = await updateState({ type: 'awareness_scan', source: 'mcp', at: now },
+      (latest) => scanAwareness(latest, now, { timeZone: config.settle.timeZone, force: true }).state);
+    return { action, ...awarenessSummary(state) };
+  }
+  if (action !== 'confirm' && action !== 'dismiss') throw new Error('action 必须是 list / confirm / dismiss / scan');
+  const id = String(input.id ?? '').trim();
+  if (!id) throw new Error('confirm / dismiss 需要 id');
+  const current = await store.read();
+  const probe = resolveAwareness(current, id, action === 'confirm' ? 'confirmed' : 'dismissed', {}, now);
+  if (!probe.found) return { action, found: false, id };
+  if (probe.already) return { action, found: true, already: probe.already, id };
+  // 注意：这里不能叫 ombre——文件顶部的 OB 客户端就叫 ombre，之前被局部变量遮住，确认从来没写进过 OB（2026-09-05 → 09-09）
+  // 3.3.3：只有他自己写的那句才进 OB；不带 text 的确认只在心潮记一笔（候选模板原文永远不进 OB）
+  let ombreResult = null;
+  const ownWords = String(input.text ?? '').trim();
+  if (action === 'confirm' && ownWords && config.ombre.writeEnabled && !config.shadowMode) {
+    const aspect = String(input.aspect ?? probe.item.aspect ?? 'patterns');
+    ombreResult = await writeAwarenessToOmbre(id, ownWords, aspect);
+  }
+  const state = await updateState({
+    type: action === 'confirm' ? 'awareness_confirm' : 'awareness_dismiss',
+    source: 'mcp',
+    details: { id, kind: probe.item.kind, ombre: ombreResult ? ombreResult.ok : null },
+    at: now,
+  }, (latest) => resolveAwareness(latest, id, action === 'confirm' ? 'confirmed' : 'dismissed', { text: input.text, note: input.note, aspect: input.aspect, ombre: ombreResult }, now).state);
+  const item = state.awareness.candidates.find((c) => c.id === id);
+  return { action, found: true, id, item, ombre: ombreResult };
+}
+
+async function writeAwarenessToOmbre(id, content, aspect) {
+  try {
+    const reply = await ombre.writeSelfAwareness(content, aspect);
+    return { ok: true, aspect, reply: String(reply ?? '').slice(0, 200) };
+  } catch (error) {
+    log('awareness_ombre_write_failed', { id, message: error.message });
+    return { ok: false, aspect, error: String(error.message ?? error).slice(0, 200) };
+  }
 }
 
 async function saveHandoffNote(note, source = 'mcp', now = new Date()) {
@@ -798,19 +1280,6 @@ async function enqueueDashboardInteraction(event, result) {
   });
   await publishReadyBridgeDeliveries();
   return { queued: true, deliveryId: queued.delivery.id, duplicate: queued.duplicate };
-}
-
-function bridgeDeliveryFromDashboard(payload = {}, now = new Date()) {
-  const allowed = new Set(['event_id', 'eventId', 'message', 'deliver_after', 'deliverAfter']);
-  const unexpected = Object.keys(payload).filter((key) => !allowed.has(key));
-  if (unexpected.length) throw new Error('bridge delivery only accepts event_id, message and deliver_after');
-  const eventId = String(payload.event_id ?? payload.eventId ?? '').trim();
-  const message = String(payload.message ?? '').replace(/\s+/g, ' ').trim();
-  const deliverAfter = payload.deliver_after ?? payload.deliverAfter ?? null;
-  if (eventId.length < 8 || eventId.length > 120) throw new Error('event_id must contain 8 to 120 characters');
-  if (!message || message.length > 1200) throw new Error('message must contain 1 to 1200 characters');
-  const scheduled = deliverAfter && Date.parse(deliverAfter) > now.getTime();
-  return { eventId, message, deliverAfter, reason: scheduled ? 'scheduled_interaction' : 'user_note' };
 }
 
 function handoffNoteFromHttp(payload = {}) {
@@ -950,6 +1419,11 @@ const server = createServer(async (request, response) => {
           return send(response, 400, { error: error.message });
         }
       }
+      if (url.pathname === '/dashboard/api/pending') {
+        // 3.3：退役。GET 回说明，PATCH 回 410，网页那页可以下线。
+        if (request.method === 'GET') return send(response, 200, await dashboardPayload(url.pathname, url));
+        return send(response, 410, { error: 'pending_from_me 已退役，黑匣子接替；人类看不到匣子里的内容。' });
+      }
       if (url.pathname === '/dashboard/api/bridge/deliveries') {
         if (!config.bridge.enabled) return send(response, 503, { error: 'bridge disabled' });
         if (request.method === 'GET') {
@@ -1079,7 +1553,19 @@ const server = createServer(async (request, response) => {
           return createContextEnvelope(args);
         },
         event: async (event) => {
+          // 硬门：他自己在窗口里直接填的类型，只认"自己动一下就能落"的四种；关系类要有她的话（exchange）为证
+          const declared = String(event.interactionType ?? event.interaction_type ?? '').trim().toLowerCase();
+          let gated = null;
+          if (config.interaction.mcpSelfReportGate && declared && !SELF_REPORT_TYPES.has(declared) && !String(event.exchange ?? '').trim()) {
+            gated = declared;
+            event.interactionType = ''; delete event.interaction_type;
+          }
+          await classifyExchange(event, 'mcp');
           const result = await recordConversationEvent(event, 'mcp');
+          if (gated) {
+            result.interaction = { type: gated, applied: false, reasonCode: 'needs_her', affectedDrives: [] };
+            log('interaction_self_report_gated', { type: gated });
+          }
           return {
             revision: result.revision,
             consciousness: result.consciousness,
@@ -1093,14 +1579,40 @@ const server = createServer(async (request, response) => {
         handoffNote: async (note) => saveHandoffNote(note, 'mcp'),
         pendingDreams,
         confirmDream: confirmDreamMemory,
-        cabinInbox: async () => cabin.unlockedUserNotes(),
+        awareness: async (input) => handleAwareness(input),
+        box: async (input) => handleBox(input),
+        toolsHide: config.toolsHide,
+        // 每个 xinchao_* 工具回应末尾的"此刻"一行（官方客户端没有钩子，靠这个拿状态）
+        nowLine: async () => {
+          const state = await store.read();
+          let boxCount = 0; try { boxCount = await blackBox.count(new Date()); } catch { boxCount = 0; }
+          const line = renderNowLine(state, new Date());
+          return boxCount > 0 ? `${line}；匣子里 ${boxCount} 条` : line;
+        },
+        personalityReflect: async (input) => personality.recordAiAssessment(input),
+        personalityStats: async () => {
+          const core = await personality.getPersonalityCore();
+          return { stats: computePersonalityStats(core), core };
+        },
+        personalityAnchorUpdate: async (input) => personality.updateAnchors(input),
+        cabinInbox: async () => cabin.aiInbox({ markRead: true }),
         cabinNote: async (note) => cabin.addNote({ ...note, from: 'ai', locked: false }),
+        // 公共留言板：只有配了令牌才把 board_post / board_read 工具暴露出来 / 接受调用。
+        boardEnabled: boardEnabled(config),
+        boardPost: async ({ content }) => postBoardMessage(config, content),
+        boardRead: async ({ limit, query }) => readBoardMessages(config, { limit, query }),
         // 心潮念网关：把 OB 记忆工具经心潮同一端点暴露/转发。
         listObTools: async () => {
           if (!config.ombre.readEnabled) return [];
           return ombre.listTools();
         },
-        callOb: async (name, args) => ombre.call(name, args),
+        // 情绪 → 记忆：他经网关调 breath/hold 没自己给坐标时，替他带上此刻情绪（grow 不碰）。
+        callOb: async (name, args) => {
+          if (!config.ombre.emotionStamp) return ombre.call(name, args);
+          const stamped = stampEmotionArgs(name, args, await store.read());
+          if (stamped.stamped) log('ombre_emotion_stamped', { tool: String(name).slice(0, 40), ...stamped.coords });
+          return ombre.call(name, stamped.args);
+        },
       });
       if (payload?.method === 'initialize' || payload?.method === 'tools/call') {
         log('mcp_request', {
@@ -1114,6 +1626,15 @@ const server = createServer(async (request, response) => {
         'Mcp-Session-Id': sessionId,
         'MCP-Protocol-Version': negotiatedProtocolVersion(request, payload, result),
       });
+    }
+    // 4.0 手机上报：用单独的 PHONE_ACTIVITY_TOKEN，不用总令牌（手机上不该放总令牌）。没开注意力监测就不收
+    if (request.method === 'POST' && url.pathname === '/v1/phone-activity') {
+      const want = process.env.PHONE_ACTIVITY_TOKEN ?? '';
+      const got = String(request.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+      if (!attention.enabled || want.length < 16) return send(response, 404, { error: 'phone activity not enabled' });
+      if (!safeEqual(got, want)) return send(response, 401, { error: 'unauthorized' });
+      try { return send(response, 200, await attention.phoneActivity(await body(request))); }
+      catch (error) { return send(response, error.status ?? 400, { error: error.message }); }
     }
     if (!authorized(request)) return send(response, 401, { error: 'unauthorized' });
 
@@ -1131,6 +1652,15 @@ const server = createServer(async (request, response) => {
         ...breathDreamContext(state, new Date()),
         generatedAt: new Date().toISOString(),
       });
+    }
+    // 钩子用的"此刻"压缩块：只读状态，不记投递、不动 pending。客户端 UserPromptSubmit 每条消息拉一次。
+    if (request.method === 'GET' && url.pathname === '/v1/now') {
+      const state = await store.read();
+      let boxCount = 0; let boxSurfaced = 0; let boxSurfacedIds = [];
+      let boxStale = 0;
+      try { boxCount = await blackBox.count(new Date()); const surf = await blackBox.surfaced(new Date()); boxSurfaced = surf.length; boxSurfacedIds = surf.map((x) => x.id); boxStale = (await blackBox.stale(new Date())).length; } catch { boxCount = 0; }
+      const now = new Date();
+      return send(response, 200, buildNowCompact(state, now, { timeZone: config.settle.timeZone, boxCount, boxSurfaced, boxSurfacedIds, boxStale, awarenessReviewWeekday: config.awareness.reviewWeekday, body: config.pulse.enabled ? bodyLine(vitalsNow(state, now)) : '', extra: nowLines.texts(now.getTime()) }));
     }
     if (request.method === 'GET' && url.pathname === '/v1/context') {
       if (!config.context.enabled) return send(response, 503, { error: 'context envelope disabled' });
@@ -1160,11 +1690,93 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && (url.pathname === '/v1/conversation-event' || url.pathname === '/v1/heartbeat')) {
       const event = await body(request);
       const source = url.pathname === '/v1/heartbeat' ? 'heartbeat' : 'api';
-      return send(response, 200, await recordConversationEvent(event, source));
+      if (source === 'api') noteRecentTurn(event?.recent ?? event?.note ?? '');   // 只留内存，给 Jev 陪跑当参照
+      if (source === 'api' && attention.enabled) await attention.noteHerWords(event?.recent ?? event?.herWords ?? event?.her_words ?? splitExchange(event?.exchange ?? '').her ?? '');
+      const classified = source === 'heartbeat' ? null : await classifyExchange(event, 'api');
+      const result = await recordConversationEvent(event, source);
+      return send(response, 200, classified?.type ? { ...result, classified } : result);
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/call') {
+      // 10-20：宿主接通/挂断时告诉心潮，通话中驱力提示先压着、挂了补一条汇总
+      const payload = await body(request);
+      // 10-24：也可以只带 sleep（睡觉模式开/关），开着睡觉模式时驱力提示不压
+      const hasSleep = typeof payload?.sleep === 'boolean';
+      if (typeof payload?.active !== 'boolean' && !hasSleep) return send(response, 400, { error: 'active 要给 true / false（或只给 sleep）' });
+      const call = await callStateStore.write(typeof payload?.active === 'boolean' ? payload.active : undefined, new Date(), hasSleep ? payload.sleep : undefined);
+      log('call_state', { active: call.active, sleep: Boolean(call.sleep) });
+      return send(response, 200, call);
+    }
+    if (request.method === 'GET' && url.pathname === '/v1/drives') {
+      // 10-26 给网页画驱力用：每股劲儿的短名、档位（静 / 平 / 涨 / 涌 / 落）、是不是刚被满足（饱足期里）、念头罐最近抽出的那句；不给小数
+      const state = await store.read();
+      const now = new Date();
+      const pool = config.bridge.drivePoolEnabled ? await drivePool.read() : { recent: {} };
+      const drives = DRIVE_KEY_LIST.map((key) => {
+        const until = Date.parse(state?.satisfactionPlateaus?.[key]?.until ?? '');
+        return {
+          key,
+          name: DRIVE_SHORT[key] ?? key,
+          level: driveLevel(key, Number(state?.drives?.[key]), driveTrend(state, key, now)),
+          satisfied: Number.isFinite(until) && until > now.getTime(),
+          line: (pool.recent?.[key] ?? []).at(-1) ?? null,
+        };
+      });
+      return send(response, 200, { drives, at: now.toISOString() });
+    }
+    if (request.method === 'GET' && url.pathname === '/v1/stream') {
+      // 10-26 订阅推送：换档、情绪换标签、睡醒、满足，一变就推（SSE）；20 秒一个心跳注释保活
+      if (stateStreams.size >= STREAM_MAX_CLIENTS) return send(response, 429, { error: `最多 ${STREAM_MAX_CLIENTS} 个订阅` });
+      response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+      response.write(`event: connected\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
+      stateStreams.add(response);
+      const beat = setInterval(() => response.write(': heartbeat\n\n'), 20_000);
+      beat.unref();
+      request.on('close', () => { clearInterval(beat); stateStreams.delete(response); });
+      return undefined;
+    }
+    if (url.pathname === '/v1/now-lines') {
+      // 10-26 外接一行：POST {source, text, minutes} 挂 / 覆盖；DELETE ?source= 摘掉；GET 只列来源和到期（不回内容）
+      if (request.method === 'POST') {
+        const r = nowLines.set(await body(request));
+        if (r.error) return send(response, r.status ?? 400, { error: r.error });
+        log('now_line', { source: r.source, chars: r.chars });
+        return send(response, 200, r);
+      }
+      if (request.method === 'DELETE') {
+        const source = url.searchParams.get('source') ?? '';
+        return send(response, 200, { removed: nowLines.remove(source) });
+      }
+      if (request.method === 'GET') return send(response, 200, { lines: nowLines.sources() });
+      return send(response, 405, { error: 'GET / POST / DELETE' });
+    }
+    if (url.pathname === '/v1/body' && (request.method === 'GET' || request.method === 'POST')) {
+      // 10-26 脉：GET 看此刻心跳、呼吸；POST 报一段临时偏移 {key|eventId, hr, breath, minutes}，同一个 key 后报的覆盖先报的
+      if (!config.pulse.enabled) return send(response, 404, { error: 'pulse disabled' });
+      if (request.method === 'POST') {
+        const off = normalizeOffset(await body(request), Date.now());
+        if (off.error) return send(response, 400, { error: off.error });
+        bodyOffsets.set(off.key, off);
+        log('body_offset', { hr: off.hr, breath: off.breath, minutes: Math.round((off.until - Date.now()) / 60_000) });
+      }
+      return send(response, 200, vitalsNow(await store.read()));
     }
     if (request.method === 'POST' && url.pathname === '/v1/handoff-note') {
       const payload = await body(request);
       return send(response, 200, await saveHandoffNote(handoffNoteFromHttp(payload), 'api'));
+    }
+    if (request.method === 'POST' && url.pathname === '/v1/satisfy') {
+      // 10-26：某股劲儿自己得到了满足（AI 自己做成了、缓过来了）：只走乘法满足 + 饱足平台；不算她来了、不叫醒、不记作息
+      const payload = await body(request);
+      const eventId = String(payload.eventId ?? payload.event_id ?? '').trim();
+      const keys = (Array.isArray(payload.drives) ? payload.drives : []).map(String);
+      if (!eventId || !keys.length) return send(response, 400, { error: '要给 eventId 和 drives（驱力 key 数组）' });
+      const now = new Date();
+      let applied = [];
+      const details = { drives: [] };
+      const state = await updateState({ type: 'satisfy', source: 'api', eventId: auditEventFingerprint(eventId), details, at: now },
+        (current) => { const r = applySatisfaction(current, keys, now, { ...config.settle, eventId }); applied = r.applied; details.drives = r.applied; return r.state; });
+      log('satisfy', { drives: applied });
+      return send(response, 200, { revision: state.revision, applied, topDrives: topDrives(state) });
     }
     if (request.method === 'POST' && url.pathname === '/v1/drive-feedback') {
       const payload = await body(request);
@@ -1187,6 +1799,19 @@ const server = createServer(async (request, response) => {
 server.listen(config.port, '0.0.0.0', async () => {
   await store.read();
   await cabin.init();
+  await blackBox.init();
+  // 3.3 升级迁移：攒下的话（pending_from_me）退役，还没说出口、也没被放下的条目搬进黑匣子当备忘，然后从状态里拿掉。
+  try {
+    const snapshot = await store.read();
+    const leftovers = (Array.isArray(snapshot.pending) ? snapshot.pending : []).filter((item) => item?.status !== 'consumed' && item?.disposition !== 'dropped' && String(item?.content ?? '').trim());
+    for (const item of leftovers) {
+      await blackBox.put({ text: String(item.content).trim(), kind: 'memo', title: `从攒下的话迁来 · ${item.kind ?? ''}`.trim(), surface: true });
+    }
+    if (Array.isArray(snapshot.pending)) {
+      await updateState({ type: 'pending_retired', source: 'migration', details: { migrated: leftovers.length }, at: new Date() }, (current) => { delete current.pending; return current; });
+      log('pending_retired', { migrated: leftovers.length });
+    }
+  } catch (error) { log('pending_migration_failed', { message: error.message }); }
   if (config.bridge.enabled) await bridgeQueue.init();
   log('service_started', { port: config.port, shadow: config.shadowMode, modelEnabled: config.model.enabled, barkEnabled: config.bark.enabled, bridgeEnabled: config.bridge.enabled });
 });
@@ -1197,7 +1822,9 @@ timer.unref();
 const bridgeTimer = setInterval(() => publishReadyBridgeDeliveries().catch((error) => log('bridge_publish_failed', { message: error.message })), config.bridge.pollSeconds * 1000);
 bridgeTimer.unref();
 
+const attentionTimer = setInterval(() => attention.tick().catch((error) => log('attention_failed', { message: error.message })), 5 * 60_000);
+attentionTimer.unref();
+
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => server.close(() => process.exit(0)));
 }
-

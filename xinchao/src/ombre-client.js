@@ -1,7 +1,16 @@
+// 【记忆（OB）】和 Ombre Brain 记忆服务打交道：拉浮现的记忆、写回、解析记忆桶。部署时 OB 要先起来。
+// 代码地图见 src/README.md。
+
+import { SYSTEM_VERSION } from './version.js';
+
+// 梦不吃技术：这些域的记忆不进梦的原料（机房梦就是这么来的）
+const DREAM_EXCLUDE_DOMAINS = new Set(['技术', '数字', '编程', '事务']);
+
 export class OmbreClient {
   constructor(config) {
     this.config = config;
     this.sessionId = null;
+    this.stateless = false;
     this.initializePromise = null;
     this.toolsCache = null;
     this.toolsPromise = null;
@@ -9,7 +18,7 @@ export class OmbreClient {
     this.memoryMetadataPromise = null;
   }
 
-  async post(payload, expectBody = true) {
+  async post(payload, expectBody = true, timeoutMs = 15000) {
     const headers = {
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
@@ -20,7 +29,7 @@ export class OmbreClient {
     const response = await fetch(this.config.url, {
       method: 'POST', headers,
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(15000)
+      signal: AbortSignal.timeout(timeoutMs)
     });
     if (!response.ok) throw new Error(`Ombre MCP failed: HTTP ${response.status}`);
     this.sessionId = response.headers.get('mcp-session-id') ?? this.sessionId;
@@ -30,7 +39,7 @@ export class OmbreClient {
   }
 
   async initialize() {
-    if (this.sessionId || this._initialized) return;
+    if (this.sessionId || this.stateless) return;
     if (!this.initializePromise) {
       this.initializePromise = (async () => {
         await this.post({
@@ -40,25 +49,48 @@ export class OmbreClient {
           params: {
             protocolVersion: '2025-06-18',
             capabilities: {},
-            clientInfo: { name: 'xinchao-dynamic-mind', version: '2.4.0' },
+            clientInfo: { name: 'xinchao-dynamic-mind', version: SYSTEM_VERSION },
           },
         });
-        // OB 1.28.x does not return Mcp-Session-Id; proceed sessionless.
-        this._initialized = true;
+        // OB 2.8.5+ 的 Streamable HTTP 是无状态 JSON 响应，不发 Mcp-Session-Id；没有就按无状态走，不当错误。
+        this.stateless = !this.sessionId;
         await this.post({ jsonrpc: '2.0', method: 'notifications/initialized' }, false);
       })().finally(() => { this.initializePromise = null; });
     }
     return this.initializePromise;
   }
 
-  async call(name, args = {}) {
+  // 4.1.1：读记忆用这个。OB 回 isError（比如老版本没有某个工具：「Unknown tool: breath_advanced」）或 JSON-RPC error 时
+  // 一律当失败抛出，绝不把报错那句话当成记忆原文往下传（4.1.0 把它当浮现原文放进了念头池）。
+  async read(name, args = {}, timeoutMs = 15000) {
+    const result = await this.call(name, args, timeoutMs);
+    const inner = result?.result ?? result;
+    if (result?.error || inner?.isError) throw new OmbreToolError(name, result?.error?.message || extractText(result) || 'isError');
+    return result;
+  }
+
+  // 4.1.1：日期过滤、带 ID 的浮现道只在新版 OB 的 breath_advanced 上。连的是没有它的 OB（比如一起打包的内置版）时，
+  // 记一次告警、以后直接走老的 breath（不传 query = 按权重浮现）；没有对应老接口的（按日期取远期）就这一项不给原料。
+  async breathAdvanced(args, fallback = null) {
+    if (!this.noAdvanced) {
+      try { return await this.read('breath_advanced', args); } catch (error) {
+        if (!(error instanceof OmbreToolError && error.unknownTool)) throw error;
+        this.noAdvanced = true;
+        console.warn(JSON.stringify({ at: new Date().toISOString(), event: 'ombre_breath_advanced_missing', note: '这个 OB 没有 breath_advanced，浮现改走 breath（没有日期窗口）；升级到带 breath_advanced 的 OB 可恢复' }));
+      }
+    }
+    return fallback ? this.read('breath', fallback) : null;
+  }
+
+  async call(name, args = {}, timeoutMs = 15000) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await this.initialize();
       try {
-        return await this.post({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call', params: { name, arguments: args } });
+        return await this.post({ jsonrpc: '2.0', id: Date.now(), method: 'tools/call', params: { name, arguments: args } }, true, timeoutMs);
       } catch (error) {
-        if (attempt || !/HTTP (400|404)/.test(error.message)) throw error;
+        if (attempt || !/HTTP (400|401|404)/.test(error.message)) throw error;
         this.sessionId = null;
+        this.stateless = false;
       }
     }
     throw new Error('Ombre MCP call failed after session refresh');
@@ -75,11 +107,13 @@ export class OmbreClient {
         try {
           await this.initialize();
           const raw = await this.post({ jsonrpc: '2.0', id: Date.now(), method: 'tools/list', params: {} });
+          if (raw?.error || raw?.result?.isError) throw new OmbreToolError('tools/list', raw?.error?.message || extractText(raw) || 'isError');
           const tools = raw?.result?.tools ?? raw?.tools ?? [];
           this.toolsCache = Array.isArray(tools) ? tools : [];
           return this.toolsCache;
         } catch (error) {
           this.sessionId = null;
+          this.stateless = false;
           if (attempt) throw error;
         }
       }
@@ -95,52 +129,122 @@ export class OmbreClient {
   // Ombre Brain 2.6.x used a parameterised `breath`; newer releases split it
   // into zero-argument breath + breath_search + breath_advanced. Discover the
   // remote schema instead of pinning Xinchao to either OB release line.
-  async callBreath({ query, maxResults, maxTokens }) {
+  async callBreath({ query, maxResults, maxTokens, emotion = null }) {
     const tools = await this.listTools();
     const names = new Set(tools.map((tool) => tool?.name));
     if (names.has('breath_advanced')) {
-      return this.call('breath_advanced', {
+      return this.read('breath_advanced', {
+        ...emotionArgs(emotion),
         query,
         max_results: maxResults,
         max_tokens: maxTokens,
       });
     }
     if (names.has('breath_search')) {
-      return this.call('breath_search', { query, max_results: maxResults });
+      return this.read('breath_search', { query, max_results: maxResults });
     }
-    return this.call('breath', { query, max_results: maxResults, max_tokens: maxTokens });
+    return this.read('breath', { query, max_results: maxResults, max_tokens: maxTokens, ...emotionArgs(emotion) });
   }
 
-  async recentMaterial(drives = []) {
+  async recentMaterial(drives = [], emotion = null) {
+    return (await this.recentMaterialWithRefs(drives, emotion)).text;
+  }
+
+  async recentMaterialWithRefs(drives = [], emotion = null) {
     const result = await this.callBreath({
+      emotion,
       query: withDriveHint('近期重要记忆、情绪、关系变化和未完成事项', drives),
       maxResults: this.config.breathMaxResults,
       maxTokens: this.config.breathMaxTokens
     });
-    return extractText(result).slice(0, 10000);
+    return materialWithRefs(extractText(result), 10000);
   }
 
-  async daytimeMaterial(drives = []) {
-    const result = await this.callBreath({
-      query: withDriveHint('白天自然浮现的近期记忆、具体细节、未说完的话和当下牵挂；不要返回系统配置或技术信息', drives),
-      maxResults: this.config.breathMaxResults,
-      maxTokens: this.config.breathMaxTokens
-    });
-    return extractText(result).slice(0, 10000);
+  async daytimeMaterial(drives = [], emotion = null) {
+    return (await this.daytimeMaterialWithRefs(drives, emotion)).text;
+  }
+
+  // 2026-09-07 改：不再把一段"指令"当 query 发给 OB——检索会拿"记忆/浮现/想起"这些词去匹配讲记忆本身的旧条目，
+  // 还会命中已沉底的桶（查询道只认词，不认 dont_surface）。改走 breath_advanced 的浮现道：不传 query，
+  // OB 按权重给未解决的记忆，本来就尊重沉底/已消化；date_from 限最近两周；mode=automatic 表明是自动召回。
+  // 驱力标签不再拼进 query，只保留情绪坐标做共振排序。
+  // 3.3.9：exclude = 最近浮现过的桶。OB 没有排除参数，所以多要几条，本地剔掉再取回原来的条数。
+  async daytimeMaterialWithRefs(drives = [], emotion = null, now = new Date(), exclude = []) {
+    const want = Number(this.config.breathMaxResults) || 3;
+    const maxResults = exclude.length ? Math.min(20, want + exclude.length + 2) : want;
+    const maxTokens = exclude.length ? 20000 : 12000;   // 核心准则段每次都在最前、单独就要六千上下，后面的浮现记忆得留出位置（只是字节，不过模型）
+    const result = await this.breathAdvanced({
+      ...emotionArgs(emotion),
+      date_from: daysAgo(now, RECENT_WINDOW_DAYS),
+      mode: 'automatic',
+      with_ids: true,
+      max_results: maxResults,
+      max_tokens: maxTokens
+    }, { ...emotionArgs(emotion), max_results: maxResults, max_tokens: maxTokens });
+    return materialWithRefs(dropBuckets(extractText(result), exclude, want), 10000);
   }
 
   // 自主念头用的材料：比日间浮现更短，只要能让念头落到具体的事上。
-  async thoughtMaterial(drives = []) {
-    const result = await this.callBreath({
-      query: withDriveHint('此刻自然想起的一件具体的事：最近的共同经历、说过的话或还惦记着的东西；不要返回系统配置、部署或技术信息', drives),
-      maxResults: Math.max(1, Math.min(3, Number(this.config.breathMaxResults) || 2)),
-      maxTokens: Math.max(200, Math.min(600, Number(this.config.breathMaxTokens) || 400))
-    });
-    return extractText(result).slice(0, 4000);
+  async thoughtMaterial(drives = [], emotion = null) {
+    return (await this.thoughtMaterialWithRefs(drives, emotion)).text;
   }
 
-  async recentContinuityMaterial(maxTokens = this.config.breathMaxTokens) {
+  async thoughtMaterialWithRefs(drives = [], emotion = null, now = new Date(), exclude = []) {
+    const want = Math.max(1, Math.min(3, Number(this.config.breathMaxResults) || 2));
+    const maxResults = exclude.length ? Math.min(20, want + exclude.length + 2) : want;
+    const maxTokens = exclude.length ? 16000 : 9000;
+    const result = await this.breathAdvanced({
+      ...emotionArgs(emotion),
+      date_from: daysAgo(now, RECENT_WINDOW_DAYS),
+      mode: 'automatic',
+      with_ids: true,
+      max_results: maxResults,
+      max_tokens: maxTokens
+    }, { ...emotionArgs(emotion), max_results: maxResults, max_tokens: maxTokens });
+    return materialWithRefs(dropBuckets(extractText(result), exclude, want), 4000);
+  }
+
+  // 梦的原料（3.3）：OB 的 dream 是"最近 N 小时有变动的记忆全量"——记忆正在被消化的东西。
+  // 按桶拆开，去掉技术/事务类，保留主题、情感坐标和正文，封顶 maxChars。
+  async digestMaterial(windowHours = 48, { maxChars = 5000, maxBuckets = 8, exclude = DREAM_EXCLUDE_DOMAINS } = {}) {
+    const result = await this.read('dream', { window_hours: windowHours }, 30000);
+    const text = extractText(result);
+    const blocks = text.split(/\n---\n/).map((b) => b.trim()).filter((b) => /^\[/.test(b));
+    const picked = [];
+    for (const block of blocks) {
+      const head = block.split('\n')[0];
+      const domains = ((head.match(/主题[:：]\s*([^\s]+)/) || [])[1] || '').split(/[,，]/).filter(Boolean);
+      if (domains.some((d) => exclude.has(d))) continue;
+      const id = (block.match(/^ID:\s*([a-f0-9]+)/m) || [])[1] || null;
+      const va = head.match(/V(-?[\d.]+)\/A(-?[\d.]+)/);
+      const body = block.split('\n').slice(1).filter((l) => !/^ID:|^👣|^↳/.test(l)).join('\n').trim();
+      if (!body) continue;
+      picked.push({ id, domains, valence: va ? Number(va[1]) : null, arousal: va ? Number(va[2]) : null, text: body.slice(0, 900) });
+      if (picked.length >= maxBuckets) break;
+    }
+    let out = '';
+    for (const item of picked) {
+      const line = `[domain:${item.domains.join(',')}]${item.valence != null ? ` [情感:V${item.valence}/A${item.arousal}]` : ''}\n${item.text}\n\n`;
+      if (out.length + line.length > maxChars) break;
+      out += line;
+    }
+    return { text: out.trim(), bucketIds: picked.map((p) => p.id).filter(Boolean), domains: [...new Set(picked.flatMap((p) => p.domains))], total: blocks.length, kept: picked.length };
+  }
+
+  // 一条远期的小事：让梦有可以跳跃的另一头。30 天以前，只要一条。
+  async farMaterial(now = new Date()) {
+    const dateTo = new Date(now.getTime() - 30 * 86_400_000).toISOString().slice(0, 10);
+    // OB 3.6：日期过滤只在 breath_advanced 上（公开 breath 不收 date_to）
+    // 同上：不传 query 走浮现道，只用 date_to 把窗口推到 30 天以前
+    const result = await this.breathAdvanced({
+      mode: 'automatic', max_results: 1, max_tokens: 10000, date_to: dateTo, with_ids: true,
+    });   // 老 OB 没有日期过滤：这一项不给原料（宁可梦里少一头，也不拿最近的事冒充远期）
+    return materialWithRefs(extractText(result), 1500);
+  }
+
+  async recentContinuityMaterial(maxTokens = this.config.breathMaxTokens, emotion = null) {
     const result = await this.callBreath({
+      emotion,
       query: [
         '新窗口近期连续性：只返回最近发生了什么，以及仍直接影响现在的人物与关系变化、生活重点和未完成约定。',
         '不要返回核心准则、自我基岩或长期画像；这些由客户端从自己的核心指令和长期记忆单独完整读取。',
@@ -163,8 +267,139 @@ export class OmbreClient {
   // 会保留 driveSnapshot / driveAffinity 等 3.0 可选字段。
   async memoryMap() {
     if (!this.config.readEnabled) return emptyMemoryMap('not_configured');
-    const result = await this.call('pulse', {});
-    return parseMemoryMapText(extractText(result));
+    // 绝不在请求里同步等 OB pulse（679+ 桶要几十秒，必然超时 502）：
+    // 有缓存就秒回（过期了顺手后台刷新）；没缓存就后台开建、本次立刻回“构建中”。
+    if (this._memoryMapCache) {
+      if (Date.now() - this._memoryMapCache.at >= 600_000) this._triggerMemoryMapBuild();
+      return this._memoryMapCache.value;
+    }
+    this._triggerMemoryMapBuild();
+    return buildingMemoryMap();
+  }
+
+  _triggerMemoryMapBuild() {
+    if (this._memoryMapBuilding) return; // 同时只跑一个构建，避免并发抢 OB
+    this._memoryMapBuilding = true;
+    (async () => {
+      try {
+        // 优先走 OB 的结构化星表路由（/api/bucket-map，sidecar token）；
+        // 老版 OB 没有这条路由时退回 pulse 文本解析（pulse 是人类摘要，
+        // 桶多时不含逐桶行，解析出 0 颗星——所以结构化路由才是正路）。
+        let map = await this.fetchBucketMapStructured();
+        if (!map) {
+          const result = await this.call('pulse', {}, 60000);
+          map = parseMemoryMapText(extractText(result));
+        }
+        if (map.available && map.stars.length) {
+          this._memoryMapCache = { at: Date.now(), value: map };
+        } else {
+          console.error('[ombre] memory map build yielded no stars', { reason: map.reason ?? null, total: map.total });
+        }
+      } catch (error) {
+        // 失败不缓存，下次请求会再次触发重试；必须留痕，不许静默。
+        console.error('[ombre] memory map build failed:', error.message);
+      } finally {
+        this._memoryMapBuilding = false;
+      }
+    })();
+  }
+
+  // OB 结构化星表（元数据，无正文）。404 = 老版 OB 没有该路由，返回 null 让调用方退回 pulse。
+  async fetchBucketMapStructured() {
+    const url = new URL(this.config.url);
+    url.pathname = '/api/bucket-map';
+    url.search = '';
+    const headers = { Accept: 'application/json', 'X-Ombre-Caller': 'dynamic-mind' };
+    if (this.config.token) headers.Authorization = `Bearer ${this.config.token}`;
+    const response = await fetch(url, { headers, signal: AbortSignal.timeout(30000) });
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`Ombre bucket-map failed: HTTP ${response.status}`);
+    const data = await response.json();
+    if (!Array.isArray(data?.stars)) return null;
+    const map = parseMemoryMapText(JSON.stringify({ stars: data.stars, stats: data.stats ?? {} }));
+    if (Number.isFinite(Number(data.total))) map.total = Number(data.total);
+    return map;
+  }
+
+  async memoryBucketPreview(bucketId, maxLines = 7) {
+    if (!this.config.readEnabled) return emptyMemoryPreview(bucketId, 'not_configured');
+    const id = String(bucketId ?? '').trim();
+    if (!/^[A-Za-z0-9._-]{1,160}$/.test(id)) return emptyMemoryPreview(id, 'invalid_id');
+    const url = new URL(this.config.url);
+    url.pathname = `/api/bucket-preview/${encodeURIComponent(id)}`;
+    url.search = '';
+    const headers = { Accept: 'application/json', 'X-Ombre-Caller': 'dynamic-mind' };
+    if (this.config.token) headers.Authorization = `Bearer ${this.config.token}`;
+    const response = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
+    if (response.status === 404) {
+      // Current standalone OB exposes this service-authenticated read route.
+      // Locked letters stay empty according to OB's AI visibility policy.
+      url.pathname = `/api/bucket/${encodeURIComponent(id)}`;
+      const detail = await fetch(url, { headers, signal: AbortSignal.timeout(10000) });
+      if (detail.status === 404) return emptyMemoryPreview(id, 'not_found');
+      if (!detail.ok) throw new Error(`Ombre bucket failed: HTTP ${detail.status}`);
+      const data = await detail.json();
+      if (data.letter_locked || data.metadata?.locked) return emptyMemoryPreview(id, 'locked');
+      return parseMemoryPreviewText(JSON.stringify({ ok: true, id: data.id, preview: data.content ?? '', truncated: true }), id, maxLines);
+    }
+    if (!response.ok) throw new Error(`Ombre preview failed: HTTP ${response.status}`);
+    return parseMemoryPreviewText(JSON.stringify({ ok: true, ...(await response.json()) }), id, maxLines);
+  }
+
+  async memoryBucketPreviews(bucketIds = [], maxLines = 7) {
+    const ids = [...new Set((Array.isArray(bucketIds) ? bucketIds : [])
+      .map(String).map((id) => id.trim()).filter(Boolean))].slice(0, 8);
+    const previews = [];
+    for (const id of ids) {
+      const item = await this.memoryBucketPreview(id, maxLines);
+      if (item.available && item.preview) previews.push(item);
+    }
+    return previews;
+  }
+
+  // 用户显式 hold 后，新产出仍走 OB 现有 grow；心潮不按 ID 改写源桶正文。
+  async storeHeldOutput(item) {
+    if (!this.config.writeEnabled) throw new Error('ombre_write_disabled');
+    const content = String(item?.content ?? '').trim();
+    if (!content) throw new Error('box_content_empty');
+    const result = await this.call('grow', {
+      content,
+      source: 'xinchao-box-keep',
+    });
+    const text = extractText(result);
+    const bucketId = parseGrowBucketIds(text)[0] ?? null;
+    if (!bucketId) throw new Error('ombre_grow_missing_bucket_id');
+    return bucketId;
+  }
+
+  // 自我觉察确认后写进 OB 的 I（候选桶，之后由 dream 见证升正式条目）。只在写开关打开时可用。
+  async writeSelfAwareness(content, aspect = 'patterns') {
+    if (!this.config.writeEnabled) throw new Error('ombre_write_disabled');
+    const text = String(content ?? '').trim();
+    if (!text) throw new Error('awareness_content_empty');
+    const result = await this.call('I', { content: text, aspect: String(aspect || 'patterns') });
+    return extractText(result).slice(0, 600);
+  }
+
+  // 只用 OB 已有 trace 记一条来源关系；不改正文、不强制 anchor、不新增 OB 写能力。
+  async traceHeldOutputSources(outputBucketId, sourceBucketIds = []) {
+    if (!this.config.writeEnabled) throw new Error('ombre_write_disabled');
+    const outputId = String(outputBucketId ?? '').trim();
+    const sourceIds = [...new Set((Array.isArray(sourceBucketIds) ? sourceBucketIds : [])
+      .map(String).map((id) => id.trim()).filter((id) => id && id !== outputId))].slice(0, 8);
+    const linked = [];
+    for (const sourceId of sourceIds) {
+      const result = await this.call('trace', {
+        bucket_id: sourceId,
+        meaning_append: `心潮延续：这段记忆后来生出一条被用户留下的独处产出（${outputId}）。`,
+      });
+      const text = extractText(result);
+      if (/^(未找到记忆桶|修改失败)/.test(text.trim())) {
+        throw new Error(`ombre_trace_failed:${sourceId}`);
+      }
+      linked.push(sourceId);
+    }
+    return linked;
   }
 
   async memoryMetadata({ refresh = false } = {}) {
@@ -176,7 +411,7 @@ export class OmbreClient {
     this.memoryMetadataPromise = (async () => {
       const map = await this.memoryMap();
       const byId = new Map((map.stars ?? []).map((star) => [String(star.id), star]));
-      this.memoryMetadataCache = { map: byId, expiresAt: Date.now() + 5 * 60_000 };
+      if (map.available) this.memoryMetadataCache = { map: byId, expiresAt: Date.now() + 5 * 60_000 };
       return byId;
     })().finally(() => { this.memoryMetadataPromise = null; });
     return this.memoryMetadataPromise;
@@ -249,6 +484,15 @@ export class OmbreClient {
 // （要有原句、词锚或高语义证据）。所以驱动力高不会凭空造出记忆，只会让
 // 本来就有证据的那几条里，跟当下状态相关的先浮上来。末尾那句兜底很重要，
 // 没有它的话强驱动力会把召回卡死成空。
+// 情绪 → 记忆：把此刻情绪坐标交给 breath 做共振排序（OB 没坐标时给中性分 0.5，有坐标就按距离算）。
+function emotionArgs(emotion) {
+  if (!emotion) return {};
+  const v = Number(emotion.valence);
+  const a = Number(emotion.arousal);
+  if (!Number.isFinite(v) || !Number.isFinite(a)) return {};
+  return { valence: Number(Math.max(0, Math.min(1, v)).toFixed(4)), arousal: Number(Math.max(0, Math.min(1, a)).toFixed(4)) };
+}
+
 function withDriveHint(base, drives) {
   const labels = (Array.isArray(drives) ? drives : [])
     .filter((item) => Number(item?.value) >= DRIVE_HINT_MIN)
@@ -264,14 +508,6 @@ const DRIVE_HINT_MAX_LABELS = 3;
 
 // 从 breath 输出里把每条桶表头的 [domain:...] 解析出来，供记忆共振算亲和度。
 // OB 2.6.5+（breath-meta）在表头带 domain/tags；老输出没有时返回空数组，不影响。
-export function parseSurfacedBucketIds(text) {
-  const ids = [];
-  const re = /\[bucket_id:([A-Za-z0-9_-]{6,120})\]/g;
-  let match;
-  while ((match = re.exec(String(text ?? ''))) !== null) ids.push(match[1]);
-  return [...new Set(ids)];
-}
-
 export function parseSurfacedDomains(text) {
   const domains = [];
   const re = /\[domain:([^\]]*)\]/g;
@@ -283,6 +519,95 @@ export function parseSurfacedDomains(text) {
     }
   }
   return [...new Set(domains)];
+}
+
+// OB breath 2.6.5+ 每个浮现桶的表头都带 [bucket_id:...]。
+// 只取表头里的 ID，不从正文猜，避免把记忆里偶然出现的字符串误当成来源桶。
+// 老版 OB 没有这个元数据时返回空数组，不影响旧调用者。
+/** 3.3.9：按桶切开浮现文本，去掉 exclude 里的桶，最多留 keep 段。只认带 [权重:…] 的段——那是浮现的记忆；
+ *  最前面的「核心准则」条目也带 bucket_id 但没有权重，整段原样保留、不计入条数。全被剔掉就只剩准则，这轮没东西浮现。 */
+export function dropBuckets(text, exclude = [], keep = Infinity) {
+  const src = String(text ?? '');
+  const ex = new Set((exclude ?? []).map(String));
+  if (!ex.size && !Number.isFinite(keep)) return src;
+  const re = /\[权重:[^\]]*\]\s*\[bucket_id:([A-Za-z0-9._-]{1,160})\]/g;
+  const starts = [];
+  let m;
+  while ((m = re.exec(src)) !== null) starts.push({ i: m.index, id: m[1] });
+  if (!starts.length) return src;
+  const head = src.slice(0, starts[0].i);
+  const blocks = starts.map((s, k) => ({ id: s.id, text: src.slice(s.i, k + 1 < starts.length ? starts[k + 1].i : src.length) }));
+  const kept = blocks.filter((b) => !ex.has(b.id)).slice(0, keep);
+  return head + kept.map((b) => b.text).join('');
+}
+
+export function parseSurfacedBucketIds(text) {
+  const ids = [];
+  const seen = new Set();
+  const re = /\[bucket_id:([A-Za-z0-9._-]{1,160})\]/g;
+  let match;
+  while ((match = re.exec(String(text ?? ''))) !== null) {
+    const id = match[1].trim();
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
+const RECENT_WINDOW_DAYS = 14;
+function daysAgo(now, days) { return new Date(now.getTime() - days * 86_400_000).toISOString().slice(0, 10); }
+
+// 把 OB 输出里不该当原料的块去掉：已沉底（"已删除到档案"）的桶、with_ids 追加的 json 尾块、预算不足提示行。
+// 也去掉"核心准则"段：那是行为底线不是记忆，每次都排在最前且很占预算；浮现原料只从"浮现记忆/久未浮现"段取。
+export function cleanSurfacedText(text) {
+  const body = String(text ?? '').split('=== ombre:result-ids ===')[0];
+  // 段标题（=== 浮现记忆 === 这类）前面没有分隔线，会和上一段最后一桶粘在一起，所以按标题也切
+  return body.split(/\n---\n|\n(?==== )/)
+    .map((block) => block.replace(/^===[^\n]*===\s*$/gm, '').replace(/^\[?token 预算不足[^\n]*\n?/gm, '').trim())
+    .filter((block) => block && !/已删除到档案|已退出日常记忆|\[核心准则\]/.test(block))
+    // 技术/事务类主题域不当浮现原料（和梦的原料同一份排除表）：他白天想起的应该是人和事，不是部署
+    .filter((block) => !(((block.match(/\[domain:([^\]]+)\]/) || [])[1] || '').split(/[,，]/).some((d) => DREAM_EXCLUDE_DOMAINS.has(d.trim()))))
+    .join('\n---\n');
+}
+
+export function materialWithRefs(text, maxChars = 10000) {
+  const limited = cleanSurfacedText(text).slice(0, Math.max(0, Number(maxChars) || 0));
+  return {
+    text: limited,
+    bucketIds: parseSurfacedBucketIds(limited),
+    domains: parseSurfacedDomains(limited),
+  };
+}
+
+// grow 返回的人类可读结果中，真实桶 ID 只出现在“→”或每条 📎/📝 之后。
+// 明确排除 batch:g_... 和正文中的偶然字符串，不做宽泛 ID 猜测。
+export function parseGrowBucketIds(text) {
+  const ids = [];
+  const seen = new Set();
+  const source = String(text ?? '');
+  const patterns = [/(?:→|[📎📝])\s*([A-Za-z0-9._-]{6,160})/g];
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(source)) !== null) {
+      const id = match[1].trim();
+      if (!seen.has(id)) {
+        seen.add(id);
+        ids.push(id);
+      }
+    }
+  }
+  return ids;
+}
+
+export class OmbreToolError extends Error {
+  constructor(tool, text) {
+    super(`Ombre tool ${tool} failed: ${String(text).slice(0, 200)}`);
+    this.name = 'OmbreToolError';
+    this.tool = tool;
+    this.unknownTool = /unknown tool/i.test(String(text));
+  }
 }
 
 function parseMcp(text) {
@@ -312,6 +637,54 @@ function emptyMemoryMap(reason = 'empty') {
       timestamps: false,
     },
   };
+}
+
+// 首次还没缓存、正在后台构建时的即时占位：available:false + reason:'building'，网页据此提示并稍后自动重试。
+function buildingMemoryMap() {
+  return {
+    schemaVersion: 2,
+    generatedAt: new Date().toISOString(),
+    available: false,
+    reason: 'building',
+    total: 0,
+    stats: {},
+    stars: [],
+    edges: [],
+    capabilities: {
+      explicitRelations: false,
+      driveSnapshots: false,
+      driveAffinity: false,
+      timestamps: false,
+    },
+  };
+}
+
+function emptyMemoryPreview(id, reason = 'empty') {
+  return { schemaVersion: 1, available: false, reason, id: String(id ?? ''), preview: '', lineCount: 0, truncated: false };
+}
+
+export function parseMemoryPreviewText(raw, expectedId = '', maxLines = 7) {
+  const text = String(raw ?? '').trim();
+  if (!text) return emptyMemoryPreview(expectedId, 'empty');
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed?.ok) return emptyMemoryPreview(expectedId, String(parsed?.error || 'not_found'));
+    const id = String(parsed.id ?? expectedId).trim();
+    if (expectedId && id !== expectedId) return emptyMemoryPreview(expectedId, 'id_mismatch');
+    const lineLimit = Math.max(1, Math.min(7, Number(maxLines) || 7));
+    const preview = String(parsed.preview ?? '').split(/\r?\n/).slice(0, lineLimit).join('\n').slice(0, 1400);
+    return {
+      schemaVersion: 1,
+      available: Boolean(preview),
+      reason: preview ? undefined : 'empty',
+      id,
+      preview,
+      lineCount: preview ? preview.split(/\r?\n/).length : 0,
+      truncated: Boolean(parsed.truncated),
+    };
+  } catch {
+    return emptyMemoryPreview(expectedId, 'invalid_response');
+  }
 }
 
 function numberOrNull(value) {
@@ -351,6 +724,18 @@ function normalizeStar(star = {}) {
     driveSnapshot: driveSnapshot && typeof driveSnapshot === 'object' ? driveSnapshot : null,
     driveAffinity: driveAffinity && typeof driveAffinity === 'object' ? driveAffinity : null,
   };
+}
+
+// 星图是可视化不是全量导出：桶越多，建边(O(pairs))和 payload 越炸。只保留最重的一批
+// ——固化(pinned)优先，其余按权重降序——把负载和总桶数脱钩。total 仍报真实数，网页显示不变。
+const MAX_MAP_STARS = 400;
+function capMapStars(stars, max = MAX_MAP_STARS) {
+  if (!Array.isArray(stars) || stars.length <= max) return stars;
+  return stars
+    .map((star, index) => ({ star, index, rank: (star.pinned ? 1e9 : 0) + (Number(star.weight) || 0) }))
+    .sort((a, b) => (b.rank - a.rank) || (a.index - b.index))
+    .slice(0, max)
+    .map((item) => item.star);
 }
 
 function buildMapEdges(stars, minShared = 3, maxPerNode = 6) {
@@ -419,7 +804,8 @@ export function parseMemoryMapText(raw) {
     const parsed = JSON.parse(text);
     const sourceStars = parsed.stars ?? parsed.nodes;
     if (Array.isArray(sourceStars)) {
-      const stars = sourceStars.map(normalizeStar).filter(Boolean);
+      const allStars = sourceStars.map(normalizeStar).filter(Boolean);
+      const stars = capMapStars(allStars);
       const explicitEdges = normalizeEdges(parsed.edges ?? parsed.links, stars);
       const capabilities = {
         explicitRelations: explicitEdges.length > 0,
@@ -431,7 +817,7 @@ export function parseMemoryMapText(raw) {
         schemaVersion: Number(parsed.schemaVersion ?? 2),
         generatedAt: String(parsed.generatedAt ?? new Date().toISOString()),
         available: true,
-        total: stars.length,
+        total: allStars.length,
         stats: parsed.stats && typeof parsed.stats === 'object' ? parsed.stats : {},
         stars,
         edges: explicitEdges.length ? explicitEdges : buildMapEdges(stars),
@@ -474,15 +860,16 @@ export function parseMemoryMapText(raw) {
       historical: true,
     }));
   }
-  const filteredStars = stars.filter(Boolean);
+  const allStars = stars.filter(Boolean);
+  const cappedStars = capMapStars(allStars);
   return {
     schemaVersion: 2,
     generatedAt: new Date().toISOString(),
     available: true,
-    total: filteredStars.length,
+    total: allStars.length,
     stats,
-    stars: filteredStars,
-    edges: buildMapEdges(filteredStars),
+    stars: cappedStars,
+    edges: buildMapEdges(cappedStars),
     capabilities: {
       explicitRelations: false,
       driveSnapshots: false,
@@ -491,4 +878,3 @@ export function parseMemoryMapText(raw) {
     },
   };
 }
-

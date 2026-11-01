@@ -1,7 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseMemoryMapText } from '../src/ombre-client.js';
+import { materialWithRefs, parseMemoryMapText, parseMemoryPreviewText, parseSurfacedBucketIds } from '../src/ombre-client.js';
+
+test('breath metadata exposes source bucket ids without guessing from body text', () => {
+  const text = `
+[bucket_id:74a5375d099c] [domain:恋爱,记忆]\n正文里偶然有 deadbeef1234 不应该被当成桶。
+---
+[语义关联] [bucket_id:16ef1d2b1fd9] [domain:内心]\n另一条。
+---
+[bucket_id:74a5375d099c]\n重复表头不重复计数。`;
+  assert.deepEqual(parseSurfacedBucketIds(text), ['74a5375d099c', '16ef1d2b1fd9']);
+  assert.deepEqual(materialWithRefs(text).bucketIds, ['74a5375d099c', '16ef1d2b1fd9']);
+  assert.deepEqual(materialWithRefs(text).domains, ['恋爱', '记忆', '内心']);
+});
 
 test('pulse text becomes a metadata-only memory map', () => {
   const result = parseMemoryMapText(`
@@ -50,4 +62,20 @@ test('structured 3.0 map preserves optional emotional stamp fields', () => {
   assert.equal(result.capabilities.driveSnapshots, true);
   assert.equal(result.capabilities.driveAffinity, true);
   assert.equal(result.capabilities.timestamps, true);
+});
+
+test('bucket preview preserves original lines but never returns more than seven', () => {
+  const source = Array.from({ length: 10 }, (_, index) => `原文第 ${index + 1} 行`).join('\n');
+  const result = parseMemoryPreviewText(JSON.stringify({ ok: true, id: 'bucket-1', preview: source, truncated: true }), 'bucket-1');
+  assert.equal(result.available, true);
+  assert.equal(result.lineCount, 7);
+  assert.equal(result.preview.split('\n').at(-1), '原文第 7 行');
+  assert.equal(result.truncated, true);
+});
+
+test('bucket preview refuses a mismatched bucket id', () => {
+  const result = parseMemoryPreviewText(JSON.stringify({ ok: true, id: 'other', preview: '不该返回' }), 'wanted');
+  assert.equal(result.available, false);
+  assert.equal(result.reason, 'id_mismatch');
+  assert.equal(result.preview, '');
 });

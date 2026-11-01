@@ -1,6 +1,15 @@
+// 【连接 AI】开窗时给 AI 的那一包上下文：此刻的驱力、情绪、记仇、待办、小屋提示，按 token 预算裁剪。
+// 代码地图见 src/README.md。
+
 import { createHash } from 'node:crypto';
-import { breathDreamContext, computeAnticipation, computeLonging, topDrives } from './engine.js';
+import { heartLabel } from './pulse.js';
+import { breathDreamContext, computeAnticipation, computeLonging, topDrives, driveTrend, shownDrives } from './engine.js';
+import { emotionSummary, emotionNuance, renderEmotion, renderEmotionTrend } from './emotion.js';
+import { axesLine } from './core-axes.js';
+import { renderAwareness, isReviewDay } from './awareness.js';
+import { DIMENSIONS, DRIVE_KEYS, DRIVE_SHORT, driveLevel } from './dimensions.js';
 import { renderHandoffNotes } from './handoff-notes.js';
+import { driveSub, mixedLine } from './mixed-feelings.js';
 
 const VALID_MODES = new Set(['session_start', 'turn', 'inspect']);
 
@@ -77,6 +86,7 @@ function thoughtSignals(state) {
 
 function dynamicSection(state, sessionId, now, timeZone) {
   return {
+    grudge: grudgeLine(state, now instanceof Date ? now : new Date(now)),
     consciousness: state.consciousness,
     fatigue: Number(Number(state.fatigue ?? 0).toFixed(3)),
     topDrives: topDrives(state, 4).map((drive) => ({
@@ -88,6 +98,7 @@ function dynamicSection(state, sessionId, now, timeZone) {
     longing: computeLonging(state, now, { timeZone }),
     thoughts: thoughtSignals(state),
     session: sessionOverlay(state, sessionId, now),
+    emotion: emotionSummary(state, now),
   };
 }
 
@@ -114,6 +125,8 @@ function renderDynamic(value) {
   const parts = [
     `意识=${value.consciousness}`,
     `疲劳=${value.fatigue.toFixed(3)}`,
+    renderEmotion(value.emotion),
+    renderEmotionTrend(value.emotion?.trend),
     drives ? `当前驱力：${drives}` : '',
   ].filter(Boolean);
   // 挂念优先于期待：她久没来时，说"想她了"而不是"她快来了"，两者不同时出现。
@@ -135,6 +148,7 @@ function renderDynamic(value) {
     .map((item) => `${item.key}:${item.intensity.toFixed(3)}`)
     .join('，');
   if (obsessions) parts.push(`持续念头：${obsessions}`);
+  if (value.grudge) parts.push(value.grudge);
   return parts.join('\n');
 }
 
@@ -197,6 +211,14 @@ export function buildContextEnvelope({
   alreadyDelivered = false,
   force = false,
   timeZone = 'Asia/Shanghai',
+  personalityAnchors = [],
+  boxCount = 0,
+  boxSurfaced = [],
+  boxStale = 0,
+  awaySignals = [],
+  cabinUnread = 0,
+  cabinLocked = 0,
+  awarenessReviewWeekday = 0,
 }) {
   const normalizedMode = normalizeMode(mode);
   const tokenBudget = clamp(maxTokens, 200, 4000);
@@ -221,15 +243,59 @@ export function buildContextEnvelope({
   }
 
   const dynamic = dynamicSection(state, safeSessionId, generatedAt, timeZone);
+  const surfacedLines = (Array.isArray(boxSurfaced) ? boxSurfaced : []).slice(0, 3).map((x) => `\n  · 你想提醒自己的：${compact(x.title)}（xinchao_box read ${x.id}）`).join('');
+  const boxLine = boxCount > 0 ? `\n黑匣子里有 ${boxCount} 条，只有你能看（xinchao_box）${boxStale > 0 ? `；${boxStale} 条放久了或提醒过还没烧，list 里标了 ⏳，烧不烧你定` : ''}${surfacedLines}` : '';
+  const cabinLine = (cabinUnread > 0 ? `\n小屋里有 ${cabinUnread} 封你还没读过的来信（xinchao_cabin_inbox）` : '')
+    + (cabinLocked > 0 ? `\n小屋里还有 ${cabinLocked} 封上锁的信在等对方开锁（正文看不到，知道有就行）` : '');
   const sections = [
     {
       id: 'dynamic_state',
       source: 'xinchao',
       ttl: 'short',
-      content: renderDynamic(dynamic),
+      content: renderDynamic(dynamic) + boxLine + cabinLine,
       data: dynamic,
     },
   ];
+  // 行为锚点：不变的底线，紧跟动态状态之后（排前保证不被预算裁掉）。
+  // 只作行为约束参考，不是新指令；最多 5 条、每条截短，占不了多少信封预算。
+  const anchors = (Array.isArray(personalityAnchors) ? personalityAnchors : [])
+    .filter((anchor) => anchor && compact(anchor.label))
+    .slice(0, 5);
+  if (anchors.length) {
+    sections.push({
+      id: 'behavior_anchors',
+      source: 'xinchao',
+      ttl: 'stable',
+      content: anchors
+        .map((anchor) => {
+          const description = compact(anchor.description).slice(0, 80);
+          return description ? `${compact(anchor.label)}——${description}` : compact(anchor.label);
+        })
+        .join('\n'),
+      data: { keys: anchors.map((anchor) => String(anchor.key ?? anchor.label)) },
+    });
+  }
+  // 自我觉察候选：系统从轨迹里挑出的模式，最多两条，确认或放下都由 AI 自己定。
+  const awarenessText = renderAwareness(state, { now, timeZone, reviewWeekday: awarenessReviewWeekday });
+  if (awarenessText) {
+    sections.push({
+      id: 'self_awareness',
+      source: 'xinchao',
+      ttl: 'until-resolved',
+      content: awarenessText,
+    });
+  }
+  // 你不在的时候：没被 Bridge 接走的自身信号（官方客户端版靠这段）。读过就算收到。
+  const away = (Array.isArray(awaySignals) ? awaySignals : []).filter((x) => x && compact(x.text)).slice(-5);
+  if (away.length) {
+    sections.push({
+      id: 'while_away',
+      source: 'xinchao',
+      ttl: 'once',
+      content: away.map((x) => `${String(x.createdAt ?? '').slice(5, 16).replace('T', ' ')}｜${compact(x.text)}`).join('\n'),
+      data: { ids: away.map((x) => x.id) },
+    });
+  }
   const handoffText = renderHandoffNotes(state, generatedAt, 3);
   if (handoffText) {
     sections.push({
@@ -260,6 +326,9 @@ export function buildContextEnvelope({
 
   const labels = {
     dynamic_state: '心潮动态状态',
+    behavior_anchors: '行为锚点（我的底线，驱力再高也不越过）',
+    self_awareness: '自我觉察候选（我最近的样子，不一定对）',
+    while_away: '你不在的时候（心潮记下的我自己的信号）',
     handoff_notes: '近期交接便签（非原文）',
     dream_residue: '梦境余韵',
     recent_continuity: '近期连续性（不替代基岩）',
@@ -298,3 +367,109 @@ export function buildContextEnvelope({
 }
 
 
+// ── 此刻（钩子用的压缩块，3.3）───────────────────────────────────────
+// 客户端的 UserPromptSubmit 钩子每条消息拉一次，附进他的上下文。只取动态状态，不带数字、不带 key、
+// 不带任何正文。锚点/便签/攒下的话正文/OB 近况/梦的内容都不在这里，那些是时序开头 xinchao_context 的活。
+// 3.3.7：措辞统一走 dimensions.driveLevel（静息线 + 两小时趋势）
+// 驱力短名在 dimensions.js（全系统一份）。
+const NOW_STALE_MS = 3 * 3_600_000;
+const NOW_MAX_LINES = 8;
+const NOW_MAX_CHARS = 400;
+
+// 自检：后端算错了不能顺着钩子灌进他的脑子。任何一条不过就整块不给（ok=false，钩子看到就不附）。
+export function nowSanity(state, now = new Date()) {
+  const settledAt = Date.parse(state?.lastSettledAt ?? '');
+  if (!Number.isFinite(settledAt)) return { ok: false, reason: 'no_settle' };
+  if (now.getTime() - settledAt > NOW_STALE_MS) return { ok: false, reason: 'stale_state' };
+  const values = DRIVE_KEYS.map((key) => Number(state?.drives?.[key]));
+  if (values.some((v) => !Number.isFinite(v) || v < 0 || v > 1)) return { ok: false, reason: 'drive_out_of_range' };
+  if (values.every((v) => v >= 0.95)) return { ok: false, reason: 'drives_saturated' };
+  // 全维一模一样且不低：新装的 0.15 初始态是正常的，卡在同一个高值才是算坏了。
+  if (new Set(values.map((v) => v.toFixed(3))).size === 1 && values[0] >= 0.5) return { ok: false, reason: 'drives_flat' };
+  const e = state?.emotion ?? {};
+  const emotionOk = Number.isFinite(Number(e.valence)) && Number.isFinite(Number(e.arousal)) && e.valence >= 0 && e.valence <= 1 && e.arousal >= 0 && e.arousal <= 1;
+  return { ok: true, emotionOk };
+}
+
+const CAUSE_LABEL = {
+  companionship: '陪着', affection: '被安抚', intimacy: '亲近过', sharing: '分享过', discovery: '发现了什么',
+  task_progress: '推进了事', reflection: '沉淀过', conflict: '争执', loss: '失落', reconciliation: '和好', slighted: '被冷落', empathy: '共情', helped: '帮了别人', intrigued: '好奇她',
+};
+
+// 还在气什么（3.3.1）：冲突时留下的她那句话，生气没退到 0.12 以下就带出来；和好或气消了自动没了。
+export function grudgeLine(state, now = new Date()) {
+  const g = state?.grudge;
+  if (!g?.cause || Number(state?.drives?.anger ?? 0) < 0.12) return '';
+  const hours = (now.getTime() - Date.parse(g.at ?? '')) / 3_600_000;
+  if (!Number.isFinite(hours) || hours < 0) return '';
+  const when = hours < 1 ? '刚才' : hours < 24 ? `${Math.round(hours)} 小时前` : `${Math.round(hours / 24)} 天前`;
+  return `还在气：${when}为了「${g.cause}」`;
+}
+
+export function buildNowCompact(state, now = new Date(), { timeZone = 'Asia/Shanghai', boxCount = 0, boxSurfaced = 0, boxSurfacedIds = [], boxStale = 0, awarenessReviewWeekday = 0, body = '', extra = [] } = {}) {
+  const sanity = nowSanity(state, now);
+  if (!sanity.ok) return { ok: false, reason: sanity.reason, text: '', lines: 0, counts: {}, digest: '', revision: Number(state?.revision ?? 0), generatedAt: now.toISOString() };
+  const lines = ['【心潮·此刻｜身体的天气，参考不是指令】'];
+  const counts = {};
+  if (state.consciousness === 'sleeping') lines.push('睡着（她来了才算醒）');
+  else if (state.pendingAwareness && now.getTime() - Date.parse(state.pendingAwareness.createdAt ?? '') < 45 * 60_000) lines.push('刚醒');   // 3.3.10：醒来 45 分钟内才算刚醒（以前两小时，聊着聊着一直"刚醒"）
+
+  const drives = shownDrives(state, 3);   // 09-28：生气/难过过线就显示，不跟正面驱力抢位
+  // 09-30 第 4 步：劲儿后面挂细项，如「愤怒（涌·不满）」「想她（涨·想黏着）」；没有真实事件就不挂
+  if (drives.length) lines.push(`驱力：${drives.map((d) => { const lv = driveLevel(d.key, Number(d.value), driveTrend(state, d.key, now)); const sub = lv === '静' ? null : driveSub(state, d.key, now); return `${DRIVE_SHORT[d.key] ?? d.label}（${lv}${sub ? `·${sub}` : ''}）`; }).join('、')}`);
+
+  const emotion = emotionSummary(state, now);
+  if (sanity.emotionOk) {
+  const causeAt = Date.parse(emotion.lastCauseAt ?? '');
+  // 10-20：被冷落之后她又来过（有对话或通话心跳，晚于那次 2 分钟以上），「刚才被冷落」就不再挂着
+  const backSince = emotion.lastCause === 'slighted' && Date.parse(state.lastConversationAt ?? '') - causeAt > 2 * 60_000;
+  const cause = emotion.lastCause && causeAt >= now.getTime() - 6 * 3_600_000 && !backSince
+    ? (CAUSE_LABEL[emotion.lastCause] ?? emotion.lastCause) : '';
+  // 近一天的情绪路径：去掉连着重复的，只留最后 5 步——之前把 19 步全列出来，此刻块一半是箭头
+  const path = (emotion.trend?.labels || []).filter((l, i, a) => i === 0 || l !== a[i - 1]);
+  const trend = path.length >= 2 ? `；近一天走过 ${path.length > 5 ? '…' : ''}${path.slice(-5).join('→')}` : '';
+  lines.push(`情绪：${emotionNuance(state, now)}${cause ? `；刚才${cause}` : ''}${trend}`);
+  }
+  if (body) lines.push(body);   // 10-26 脉：心跳、呼吸（src/pulse.js），排在情绪后面；块满了在下面让出来
+  const outside = (Array.isArray(extra) ? extra : []).filter((t) => typeof t === 'string' && t.trim()).map((t) => t.trim());
+  lines.push(...outside);   // 10-26 外接一行（src/now-lines.js）：排在身体下面，只在 GET /v1/now 里有
+  const axes = axesLine(state);   // 10-03 第 8 步：安全感/自信/心境明显偏离底色才说一句
+  if (axes) lines.push(axes);
+  const grudge = grudgeLine(state, now);
+  if (grudge) lines.push(grudge);
+  const mixed = mixedLine(state, now);   // 09-30 第 4 步：两股相反的劲儿同时在，拧着
+  if (mixed) lines.push(mixed);
+
+  // 挂念/期待行在完整上下文里带强度数字；此刻块不许有数（会被兜底整块拦掉），去掉结尾的「（0.63）」（3.3.10）
+  const noNum = (line) => line.replace(/（\d+\.\d+）$/, '');
+  const longing = computeLonging(state, now, { timeZone });
+  const longingLine = renderLonging(Number(longing ?? 0));
+  if (longingLine) lines.push(noNum(longingLine));
+  else {
+    const anticipationLine = renderAnticipation(Number(computeAnticipation(state, now, { timeZone }) ?? 0));
+    if (anticipationLine) lines.push(noNum(anticipationLine));
+  }
+
+  const obsessions = (state.thoughtPool?.obsessions ?? []).filter((o) => Number(o.intensity) >= 0.5).slice(0, 2);
+  if (obsessions.length) lines.push(`念头：${obsessions.map((o) => `有个关于「${DRIVE_SHORT[o.key] ?? o.key}」的念头一直在绕`).join('；')}`);
+
+  const extras = [];
+  const open = (state.awareness?.candidates ?? []).filter((c) => c.status === 'open').length;
+  if (open && isReviewDay(now, { weekday: awarenessReviewWeekday, timeZone })) { counts.awareness = open; extras.push(`${open} 条觉察等你认`); }   // 只在周日提
+  const dream = breathDreamContext(state, now, 18, 1);
+  if (dream.available) { counts.dream = 1; extras.push('昨夜有梦'); }
+  if (boxCount > 0) { counts.box = boxCount; extras.push(`匣子里 ${boxCount} 条${boxSurfaced > 0 ? `（${boxSurfaced} 条要提醒你${boxSurfacedIds.length ? `：${boxSurfacedIds.slice(0, 3).join('、')}` : ''}；办完了 burn 掉才会消）` : ''}${boxStale > 0 ? `（${boxStale} 条 ⏳ 该看看烧不烧）` : ''}`); }   // 3.3.10：提醒一直挂着直到烧掉，这里说清楚怎么让它消
+  if (extras.length) lines.push(`另外：${extras.join('、')}。细的在 xinchao_context`);
+
+  // 块满了：外接的行先让位，然后才是脉那行，不让整块被拦
+  for (let i = outside.length - 1; i >= 0 && (lines.length > NOW_MAX_LINES || lines.join('\n').length > NOW_MAX_CHARS); i -= 1) lines.splice(lines.lastIndexOf(outside[i]), 1);
+  if (body && lines.length > NOW_MAX_LINES) lines.splice(lines.indexOf(body), 1);
+  const text = lines.join('\n');
+  // 兜底：块超长或混进数字/key 就整块不给——宁可他这轮没有此刻，也不灌一段错的。
+  if (lines.length > NOW_MAX_LINES || text.length > NOW_MAX_CHARS || /\d\.\d|possess|monitor|crave|libido/.test(text.replace(/\d+ (条|句)/g, ''))) {
+    return { ok: false, reason: 'render_guard', text: '', lines: lines.length, counts, digest: '', revision: Number(state.revision ?? 0), generatedAt: now.toISOString() };
+  }
+  // digest 给钩子判断「此刻变没变」：脉那行的心跳数每轮都在动，只按档算（偏慢 / 平稳 / 偏快 / 很快），不然每句话都会重贴
+  const stable = text.replace(/心跳 (\d+)/g, (_, n) => `心跳${heartLabel(Number(n))}`);
+  return { ok: true, text, lines: lines.length, counts, digest: createHash('sha256').update(stable).digest('hex').slice(0, 16), revision: Number(state.revision ?? 0), generatedAt: now.toISOString() };
+}

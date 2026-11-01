@@ -1,4 +1,14 @@
-import { DIMENSIONS, DRIVE_KEYS } from './dimensions.js';
+// 【网页与看板】给平台网页的快照：网页只读这里给出的字段。字段格式是网页和各家心潮之间的约定（见 docs/4.0/快照字段.md）。
+// 代码地图见 src/README.md。
+
+import { AXES, moodOf } from './core-axes.js';
+import { recentMarks } from './emotion-marks.js';
+import { DIMENSIONS, DRIVE_KEYS, DRIVE_SHORT, driveLevel } from './dimensions.js';
+import { driveTrend } from './engine.js';
+import { driveSub } from './mixed-feelings.js';
+import { buildConnectionDiagnostics } from './connection-diagnostics.js';
+import { emotionSummary } from './emotion.js';
+import { awarenessSummary } from './awareness.js';
 
 const clamp = (value, min = 0, max = 1) => Math.max(min, Math.min(max, Number(value) || 0));
 
@@ -11,25 +21,38 @@ function validDate(value) {
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
-function driveLevel(value) {
+function driveLevel_(value) {
   if (value >= 0.75) return 'surging';
   if (value >= 0.5) return 'rising';
   if (value >= 0.25) return 'present';
   return 'quiet';
 }
 
-function projectedDrives(state) {
+function projectedDrives(state, now = new Date()) {
+  const trail = Array.isArray(state?.driveTrail) ? state.driveTrail.slice(-48) : [];
   return DRIVE_KEYS.map((key) => {
     const value = Number(clamp(state?.drives?.[key]).toFixed(4));
+    // 10-31 网页花瓣（4.3）：两小时涨落（涌/涨/平/落/静，和【心潮·此刻】同一个算法）、细项（吃醋、心疼…，没有真实事件就 null）、
+    // 刚被满足的饱足平台（until 之前不涨）、过去 24 小时的起伏（driveTrail 里这一股的 48 个点）。旧网页不认这几个字段，照旧只画高度。
+    let trend = null; let sub = null;
+    try { trend = projectedLevel(key, value, driveTrend(state, key, now)); } catch { /* 算不出就不给 */ }
+    try { sub = trend && trend !== '静' ? (driveSub(state, key, now) || null) : null; } catch { /* */ }
+    const until = Date.parse(state?.satisfactionPlateaus?.[key]?.until ?? '');
     return {
       key,
       label: DIMENSIONS[key].label,
+      short: DRIVE_SHORT[key] ?? null,   // 10-03 网页花瓣用的短名（想她、牵挂…），跟心潮这一份走
       value,
       percent: Math.round(value * 100),
-      level: driveLevel(value),
+      level: driveLevel_(value),
+      trend,
+      sub: typeof sub === 'string' ? sub : sub?.label ?? null,
+      satiety: Number.isFinite(until) && until > now.getTime() ? { until: new Date(until).toISOString() } : null,
+      trail: trail.map((p) => ({ at: validDate(p?.at), v: Number(clamp(p?.drives?.[key]).toFixed(3)) })).filter((p) => p.at),
     };
   });
 }
+function projectedLevel(key, value, delta) { return driveLevel(key, value, delta); }
 
 function projectedThoughts(state, includePrivateText = false) {
   const flash = Array.isArray(state?.thoughtPool?.flash) ? state.thoughtPool.flash : [];
@@ -84,7 +107,10 @@ function projectedDreams(state, includePrivateText, limit = 12) {
       lucidity,
       savedToOmbre: Boolean(dream?.ombreBucketId),
       ombreBucketId: compact(dream?.ombreBucketId, 120) || null,
+      // 3.3：醒来心情公开（只是两个数），意象随正文挂私密门
+      mood: dream?.mood && Number.isFinite(Number(dream.mood.valence)) ? { valence: Number(clamp(dream.mood.valence).toFixed(3)), arousal: Number(clamp(dream.mood.arousal).toFixed(3)) } : null,
       ...(includePrivateText ? {
+        image: compact(dream?.image, 24) || null,
         dream: compact(dream?.dream, 4000) || null,
         summary,
         residue: compact(dream?.residue, 1200) || null,
@@ -101,9 +127,36 @@ function activeSessionCount(state, now) {
   }).length;
 }
 
-export function buildDashboardSnapshot(state = {}, config = {}, now = new Date()) {
+function projectedPersonality(core = {}, config = {}) {
+  const dimensions = Array.isArray(core?.dimensions) ? core.dimensions : [];
+  const history = Array.isArray(core?.history) ? core.history : [];
+  const includePrivateText = Boolean(config.dashboard?.includePrivateText);
+  return {
+    available: dimensions.length > 0,
+    constellation: compact(config.personality?.zodiac, 40) || null,
+    month: compact(core?.month ?? history.at(-1)?.month, 7) || null,
+    updatedAt: validDate(core?.updatedAt),
+    ...(includePrivateText && core?.periodSummary ? { periodSummary: compact(core.periodSummary, 1500) } : {}),
+    // 行为锚点：label 是身份宣言可默认展示；description 更私密，挂 includePrivateText 门。
+    anchors: (Array.isArray(core?.anchors) ? core.anchors : []).map((anchor) => ({
+      key: compact(anchor?.key, 60),
+      label: compact(anchor?.label, 40),
+      addedAt: validDate(anchor?.addedAt),
+      ...(includePrivateText ? { description: compact(anchor?.description, 300) } : {}),
+    })).filter((anchor) => anchor.label),
+    dimensions: dimensions.map((dimension) => ({
+      key: compact(dimension?.key, 80),
+      label: compact(dimension?.label, 80),
+      score: Number.isFinite(Number(dimension?.score)) ? Number(dimension.score) : 70,
+      delta: Number.isFinite(Number(dimension?.delta)) ? Number(dimension.delta) : 0,
+      ...(includePrivateText ? { reason: compact(dimension?.reason, 1200) } : {}),
+    })).filter((dimension) => dimension.key || dimension.label),
+  };
+}
+
+export function buildDashboardSnapshot(state = {}, config = {}, now = new Date(), personalityCore = {}) {
   const generatedAt = new Date(now);
-  const drives = projectedDrives(state);
+  const drives = projectedDrives(state, generatedAt);
   const lastPresenceAt = validDate(state.lastHeartbeatAt ?? state.lastConversationAt);
   const lastPresenceMs = Date.parse(lastPresenceAt ?? '');
   const idleMinutes = Number.isFinite(lastPresenceMs)
@@ -134,6 +187,28 @@ export function buildDashboardSnapshot(state = {}, config = {}, now = new Date()
     },
     drives,
     topDrives,
+    // 情绪层（3.3）：此刻的心情，和驱力分开。成因是互动类型名，不含正文。
+    // 10-03 第 8 步：花蕊——安全感（外圈）、自信（里圈）、心境（颜色）
+    stamen: { security: Number(state.axes?.security ?? AXES.baseline.security), confidence: Number(state.axes?.confidence ?? AXES.baseline.confidence), mood: moodOf(state), baseline: AXES.baseline },
+    emotion: {
+      ...emotionSummary(state, generatedAt),
+      journal: (Array.isArray(state.emotionJournal) ? state.emotionJournal : []).slice(-48),
+      days: state.emotionDays && typeof state.emotionDays === 'object' ? state.emotionDays : {},
+      // 10-03 潮汐带浮标：最近 24 小时有起因的情绪；原话只在开了私密文字时给
+      marks: recentMarks(state, generatedAt, { includePrivateText: Boolean(config.dashboard?.includePrivateText) }),
+    },
+    // 10-03 矛盾：正在拧着的那一场（收掉的不给）
+    mixed: state.selfSignals?.mixed && !state.selfSignals.mixed.capped ? { id: state.selfSignals.mixed.id, name: state.selfSignals.mixed.name, since: state.selfSignals.mixed.since } : null,
+    personality: projectedPersonality(personalityCore, config),
+    // 自我觉察（3.3）：候选与已确认，文本是关于 AI 自己的模式描述，不含对话正文。
+    awareness: awarenessSummary(state),
+    // 心潮自身信号（3.3）：他不在窗口时心潮记下并递出去的那几句。只有类型、时间和那一句，没有正文以外的东西。
+    signals: (() => {
+      const history = Array.isArray(state.selfSignals?.history) ? state.selfSignals.history : [];
+      const recent = history.slice(-20).reverse().map((item) => ({ kind: compact(item?.kind, 40), subject: compact(item?.subject, 40), text: compact(item?.text, 80) || null, at: validDate(item?.at) }));
+      const dayAgo = generatedAt.getTime() - 24 * 3_600_000;
+      return { last24h: history.filter((item) => Date.parse(item?.at ?? '') >= dayAgo).length, recent };
+    })(),
     thoughts: projectedThoughts(state, Boolean(config.dashboard?.includePrivateText)),
     dreams: projectedDreams(
       state,
@@ -155,39 +230,44 @@ export function buildDashboardSnapshot(state = {}, config = {}, now = new Date()
       wakeBridgeProtocol: Boolean(config.bridge?.enabled),
       privateDreamText: Boolean(config.dashboard?.includePrivateText),
     },
+    connections: buildConnectionDiagnostics(config),
   };
 }
 
 export function buildConnectionManifest(config = {}) {
-  const dashboardBaseUrl = String(config.dashboard?.publicBaseUrl || config.oauth?.publicBaseUrl || '').replace(/\/$/, '');
-  const mcpBaseUrl = String(config.oauth?.publicBaseUrl || config.dashboard?.publicBaseUrl || '').replace(/\/$/, '');
+  // Dashboard and MCP may share a host, but their settings and credentials are
+  // independent. Never fall back from one base URL to the other: that hides
+  // incomplete configuration and encourages users to paste the wrong address.
+  const dashboardBaseUrl = String(config.dashboard?.publicBaseUrl || '').replace(/\/$/, '');
+  const mcpBaseUrl = String(config.oauth?.publicBaseUrl || '').replace(/\/$/, '');
   return {
     schemaVersion: 1,
     system: 'xinchao-dynamic-mind',
     publicBaseUrl: dashboardBaseUrl || mcpBaseUrl || null,
+    connections: buildConnectionDiagnostics(config),
     profiles: [
       {
         id: 'web-dashboard',
         audience: ['desktop-browser', 'mobile-browser', 'self-hosted-frontend'],
-        enabled: Boolean(config.dashboard?.enabled),
+        enabled: Boolean(config.dashboard?.enabled && dashboardBaseUrl),
         auth: 'http-only-session-cookie',
-        endpoint: dashboardBaseUrl ? `${dashboardBaseUrl}/dashboard/session` : '/dashboard/session',
+        endpoint: dashboardBaseUrl ? `${dashboardBaseUrl}/dashboard/session` : null,
         note: '网页只提交一次 Dashboard 访问口令；服务密钥不会进入浏览器。',
       },
       {
         id: 'remote-mcp-oauth',
         audience: ['claude', 'chatgpt', 'gemini', 'oauth-capable-ai'],
-        enabled: Boolean(config.mcp?.enabled && config.oauth?.enabled),
+        enabled: Boolean(config.mcp?.enabled && config.oauth?.enabled && mcpBaseUrl),
         auth: 'oauth-2.1-pkce',
-        endpoint: mcpBaseUrl ? `${mcpBaseUrl}/mcp` : '/mcp',
+        endpoint: mcpBaseUrl ? `${mcpBaseUrl}/mcp` : null,
         note: '优先用于支持远程 MCP 与 OAuth 的网页 AI。',
       },
       {
         id: 'remote-mcp-bearer',
         audience: ['claude-code', 'codex', 'ide', 'agent-runtime'],
-        enabled: Boolean(config.mcp?.enabled),
+        enabled: Boolean(config.mcp?.enabled && mcpBaseUrl),
         auth: 'bearer-token',
-        endpoint: mcpBaseUrl ? `${mcpBaseUrl}/mcp` : '/mcp',
+        endpoint: mcpBaseUrl ? `${mcpBaseUrl}/mcp` : null,
         note: 'Bearer 仅放在本地配置或服务器环境变量中。',
       },
       {

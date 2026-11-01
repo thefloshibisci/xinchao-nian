@@ -31,6 +31,7 @@ test('current Ombre pulse metadata maps surfaced bucket ids back to domains', as
   ombre.memoryMap = async () => {
     pulseCalls += 1;
     return {
+      available: true,
       stars: [
         { id: '6ef1886eb8d3', domains: ['编程', '自省'], tags: ['技术'] },
         { id: '24fee7f0d130', domains: ['恋爱', '自省'], tags: ['生活'] },
